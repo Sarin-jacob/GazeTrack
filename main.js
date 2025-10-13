@@ -34,24 +34,44 @@ const LEFT_IRIS = [469, 470, 471, 472];
 
 // --- MODIFICATIONS FOR ACCURACY ---
 const SMOOTHING_ALPHA = 0.45; // Reduced smoothing for faster response to raw prediction.
-const CALIBRATION_POINTS = [ // Increased from 9 to 17 points for better screen coverage
-    // Center
-    { x: 0.5, y: 0.5 },
-    // Top Row
-    { x: 0.05, y: 0.1 }, { x: 0.5, y: 0.1 }, { x: 0.95, y: 0.1 },
-    // Mid Row
-    { x: 0.1, y: 0.5 }, { x: 0.9, y: 0.5 },
-    // Bottom Row
-    { x: 0.05, y: 0.9 }, { x: 0.5, y: 0.9 }, { x: 0.95, y: 0.9 },
-    // Corners
-    { x: 0.05, y: 0.05 }, { x: 0.95, y: 0.05 }, { x: 0.05, y: 0.95 }, { x: 0.95, y: 0.95 },
-    // Inner Points
-    { x: 0.3, y: 0.3 }, { x: 0.7, y: 0.3 }, { x: 0.3, y: 0.7 }, { x: 0.7, y: 0.7 },
-];
+const CALIBRATION_POINTS = generateCalibrationPoints(15); // Dynamically generate ~12 points based on aspect ratio
 const HOLD_DURATION_MS = 2500; // Increased hold time for more data samples per point.
 const TRANSITION_DURATION_MS = 1000;
 // --- END MODIFICATIONS ---
 
+/**
+ * Generates a grid of calibration points dynamically based on the viewport's aspect ratio,
+ * including points near the edges.
+ * @param {number} totalPoints - The approximate number of points you want in the grid.
+ * @param {number} margin - The padding from the edge (e.g., 0.05 for 5%).
+ * @returns {Array<Object>} An array of {x, y} point objects.
+ */
+function generateCalibrationPoints(totalPoints = 12, margin = 0.05) {
+    const points = [];
+    const aspectRatio = window.innerWidth / window.innerHeight;
+
+    // Calculate the ideal number of points for each axis
+    const ny = Math.max(2, Math.round(Math.sqrt(totalPoints / aspectRatio)));
+    const nx = Math.max(2, Math.round(ny * aspectRatio));
+    
+    // The total range to generate points within, e.g., 0.9 for a 0.05 margin (1.0 - 2 * 0.05)
+    const span = 1 - 2 * margin;
+
+    for (let j = 0; j < ny; j++) {
+        for (let i = 0; i < nx; i++) {
+            // The formula i / (n - 1) creates evenly spaced points from 0 to 1.
+            // We then scale by our span and shift by the margin.
+            // A special check handles the case where there's only one point on an axis.
+            const x = (nx === 1) ? 0.5 : margin + (i / (nx - 1)) * span;
+            const y = (ny === 1) ? 0.5 : margin + (j / (ny - 1)) * span;
+            
+            points.push({ x, y });
+        }
+    }
+
+    console.log(`Generated a ${nx}x${ny} edge-to-edge grid (${points.length} points) for aspect ratio ${aspectRatio.toFixed(2)}.`);
+    return points;
+}
 
 // --- Main Initialization ---
 async function initialize() {
