@@ -21,18 +21,6 @@ body {
     overflow: hidden;
 }
 
-#stage {
-    position: relative;
-    width: 89vw;
-    /* max-width: 1280px; */
-    /* aspect-ratio: 16 / 9; */
-    background: #000;
-    border-radius: 12px;
-    overflow: hidden;
-    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
-    height: 89vh;
-}
-
 video, canvas {
     position: absolute;
     left: 0;
@@ -47,6 +35,8 @@ video, canvas {
     display: flex;
     gap: 12px;
     align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
 }
 
 button {
@@ -136,4 +126,22 @@ button:disabled {
     z-index: 50;
     display: none; /* Hidden by default */
     transition: left 0.08s linear, top 0.08s linear; /* Smoothing */
+}
+#app-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 90%;
+    max-width: 1400px; /* Optional: constrain max width on very large screens */
+}
+#stage {
+    position: relative;
+    width: 90%; 
+    height: auto;
+    max-width: 1280px;
+    aspect-ratio: 16 / 9; /* Ensures the stage keeps its shape */
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.2);
 }
