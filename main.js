@@ -106,7 +106,8 @@ async function startCamera() {
             
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
-            
+            const stage = document.getElementById('stage');
+            stage.style.aspectRatio = video.videoWidth / video.videoHeight;
             state.isCameraOn = true;
             updateUI();
             updateStatus('Camera on.');

@@ -139,8 +139,9 @@ button:disabled {
     position: relative;
     width: 90%; 
     height: auto;
+    max-height: 80vh; 
     max-width: 1280px;
-    aspect-ratio: 16 / 9; /* Ensures the stage keeps its shape */
+    /* aspect-ratio: 16 / 9; Ensures the stage keeps its shape */
     background: #000;
     border-radius: 12px;
     overflow: hidden;
