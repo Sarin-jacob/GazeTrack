@@ -51,19 +51,20 @@ function generateCalibrationPoints(totalPoints = 12, margin = 0.05) {
     const aspectRatio = window.innerWidth / window.innerHeight;
 
     // Calculate the ideal number of points for each axis
-    const ny = Math.max(2, Math.round(Math.sqrt(totalPoints / aspectRatio)));
-    const nx = Math.max(2, Math.round(ny * aspectRatio));
+    let ny = Math.max(2, Math.round(Math.sqrt(totalPoints / aspectRatio)));
+    let nx = Math.max(2, Math.round(ny * aspectRatio));
     
     // The total range to generate points within, e.g., 0.9 for a 0.05 margin (1.0 - 2 * 0.05)
     const span = 1 - 2 * margin;
 
+    nx= Math.max(3, nx);
+    ny= Math.max(3, ny);
     for (let j = 0; j < ny; j++) {
         for (let i = 0; i < nx; i++) {
             // The formula i / (n - 1) creates evenly spaced points from 0 to 1.
             // We then scale by our span and shift by the margin.
-            // A special check handles the case where there's only one point on an axis.
-            const x = (nx === 1) ? 0.5 : margin + (i / (nx - 1)) * span;
-            const y = (ny === 1) ? 0.5 : margin + (j / (ny - 1)) * span;
+            const x = margin + (i / (nx - 1)) * span;
+            const y = margin + (j / (ny - 1)) * span;
             
             points.push({ x, y });
         }
