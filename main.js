@@ -91,14 +91,29 @@ async function toggleCamera() {
 
 async function startCamera() {
     try {
-        state.videoStream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: 'user' } });
+        const constraints = {
+            video: {
+                facingMode: 'user',
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            }
+        };
+        state.videoStream = await navigator.mediaDevices.getUserMedia(constraints);
         video.srcObject = state.videoStream;
-        await video.play();
-        canvas.width = video.videoWidth;
-        canvas.height = video.videoHeight;
-        state.isCameraOn = true;
-        updateStatus('Camera on.');
-        predictLoop();
+
+        video.onloadedmetadata = () => {
+            video.play();
+            
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            
+            state.isCameraOn = true;
+            updateStatus('Camera on.');
+            predictLoop();
+            
+            console.log(`Camera started with resolution: ${video.videoWidth}x${video.videoHeight}`);
+        };
+
     } catch (error) {
         console.error("Error accessing camera:", error);
         updateStatus('Camera access denied.');
