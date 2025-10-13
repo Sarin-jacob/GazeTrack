@@ -108,6 +108,7 @@ async function startCamera() {
             canvas.height = video.videoHeight;
             
             state.isCameraOn = true;
+            updateUI();
             updateStatus('Camera on.');
             predictLoop();
             
@@ -128,6 +129,7 @@ function stopCamera() {
     state.isCameraOn = false;
     cancelAnimationFrame(state.animationFrameId);
     updateStatus('Camera off.');
+    updateUI();
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 }
 
