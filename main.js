@@ -1,6 +1,7 @@
-// main_slow.js - A more accurate, but slower, version.
+// main.js - Camera, calibration flow and UI. The gaze maths lives in gaze-model.js.
 
 import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+import { RIGHT_IRIS, LEFT_IRIS, extractFrame, fitModel, predict, isBlink, OneEuroFilter } from "./gaze-model.js";
 const { FaceLandmarker, FilesetResolver } = vision;
 
 // --- DOM Elements ---
@@ -15,6 +16,7 @@ const statusText = document.getElementById('status-text');
 const toggleVideoBtn = document.getElementById('toggle-video-btn');
 const startCalBtn = document.getElementById('start-cal-btn');
 const clearCalBtn = document.getElementById('clear-cal-btn');
+const testBtn = document.getElementById('test-btn');
 
 // --- App State ---
 let state = {
@@ -24,20 +26,47 @@ let state = {
     isCalibrating: false,
     animationFrameId: null,
     videoStream: null,
-    coeffs: { x: null, y: null },
-    lastPrediction: { x: 0.5, y: 0.5 }
+    model: null,
+    onFrame: null, // Set during calibration to receive each new frame.
+    lastVideoTime: -1,
+    filters: { x: new OneEuroFilter(), y: new OneEuroFilter() }
 };
 
 // --- Constants ---
-const RIGHT_IRIS = [474, 475, 476, 477];
-const LEFT_IRIS = [469, 470, 471, 472];
+const CALIBRATION_POINT_COUNT = 15;
+const SETTLE_DURATION_MS = 300; // The eyes need a moment to land on the point.
+const HOLD_DURATION_MS = 1300;
+const TRANSITION_DURATION_MS = 700;
+const READ_DURATION_MS = 1800; // Time to read a head-movement prompt before samples are taken.
+const HEAD_MOVE_DURATION_MS = 4500;
+const MIN_SAMPLES = 200;
+const MIN_HEAD_MOTION = { tanYaw: 0.03, tx: 0.7 }; // Standard deviations; below both, the head barely moved.
+const OPEN_EYE_RATIO = 0.7; // Frames this far under a point's typical eye openness are blinks.
 
-// --- MODIFICATIONS FOR ACCURACY ---
-const SMOOTHING_ALPHA = 0.45; // Reduced smoothing for faster response to raw prediction.
-const CALIBRATION_POINTS = generateCalibrationPoints(15); // Dynamically generate ~12 points based on aspect ratio
-const HOLD_DURATION_MS = 2500; // Increased hold time for more data samples per point.
-const TRANSITION_DURATION_MS = 1000;
-// --- END MODIFICATIONS ---
+// The model can only learn what head movement does if it sees some. Each step moves the head
+// while the eyes stay on a fixed dot, so the gaze target is known while head and eyes both change.
+const HEAD_MOVES = [
+    { point: { x: 0.5, y: 0.5 }, text: 'Eyes on the dot. Slowly turn your head left and right' },
+    { point: { x: 0.1, y: 0.1 }, text: 'Eyes on the dot. Slowly nod up and down' },
+    { point: { x: 0.9, y: 0.1 }, text: 'Eyes on the dot. Slide your head left and right' },
+    { point: { x: 0.9, y: 0.9 }, text: 'Eyes on the dot. Lean in, then back' },
+    { point: { x: 0.1, y: 0.9 }, text: 'Eyes on the dot. Sit up tall, then slouch' }
+];
+
+// Accuracy test: look at known points with the head held in different places. The points are
+// off the calibration grid, so this measures the model on data it was not fitted to.
+const TEST_POSE_DURATION_MS = 3500;
+const TEST_SETTLE_DURATION_MS = 500;
+const TEST_HOLD_DURATION_MS = 1000;
+const TEST_POINTS = [{ x: 0.3, y: 0.3 }, { x: 0.7, y: 0.3 }, { x: 0.7, y: 0.7 }, { x: 0.3, y: 0.7 }];
+const TEST_POSES = [
+    { name: 'still', text: 'Sit normally' },
+    { name: 'left', text: 'Move your head about 10 cm to your left and stay there' },
+    { name: 'right', text: 'Move your head about 10 cm to your right and stay there' },
+    { name: 'closer', text: 'Lean about 15 cm closer and stay there' },
+    { name: 'further', text: 'Lean about 15 cm back and stay there' },
+    { name: 'turned', text: 'Turn your head a little to one side and keep it there' }
+];
 
 /**
  * Generates a grid of calibration points dynamically based on the viewport's aspect ratio,
@@ -53,7 +82,7 @@ function generateCalibrationPoints(totalPoints = 12, margin = 0.05) {
     // Calculate the ideal number of points for each axis
     let ny = Math.max(2, Math.round(Math.sqrt(totalPoints / aspectRatio)));
     let nx = Math.max(2, Math.round(ny * aspectRatio));
-    
+
     // The total range to generate points within, e.g., 0.9 for a 0.05 margin (1.0 - 2 * 0.05)
     const span = 1 - 2 * margin;
 
@@ -65,7 +94,7 @@ function generateCalibrationPoints(totalPoints = 12, margin = 0.05) {
             // We then scale by our span and shift by the margin.
             const x = margin + (i / (nx - 1)) * span;
             const y = margin + (j / (ny - 1)) * span;
-            
+
             points.push({ x, y });
         }
     }
@@ -90,6 +119,7 @@ async function setupFaceLandmarker() {
         state.faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
             baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task' },
             outputFaceBlendshapes: false,
+            outputFacialTransformationMatrixes: true,
             runningMode: 'VIDEO',
             numFaces: 1
         });
@@ -124,7 +154,7 @@ async function startCamera() {
 
         video.onloadedmetadata = () => {
             video.play();
-            
+
             canvas.width = video.videoWidth;
             canvas.height = video.videoHeight;
             const stage = document.getElementById('stage');
@@ -133,7 +163,7 @@ async function startCamera() {
             updateUI();
             updateStatus('Camera on.');
             predictLoop();
-            
+
             console.log(`Camera started with resolution: ${video.videoWidth}x${video.videoHeight}`);
         };
 
@@ -156,27 +186,38 @@ function stopCamera() {
 }
 
 // --- Prediction Loop ---
+// The only place that runs detection, so calibration and tracking never process a frame twice.
 async function predictLoop() {
     if (!state.isCameraOn || !state.modelLoaded) return;
 
     try {
-        const results = await state.faceLandmarker.detectForVideo(video, performance.now());
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-        if (results.faceLandmarks.length > 0) {
-            const landmarks = results.faceLandmarks[0];
-            const irisData = getIrisData(landmarks);
-            drawIrisPoints(irisData.leftCenter, irisData.rightCenter);
-
-            if (state.coeffs.x && state.coeffs.y && !state.isCalibrating) {
-                predictGaze(irisData);
-            }
+        if (video.currentTime !== state.lastVideoTime) {
+            state.lastVideoTime = video.currentTime;
+            processFrame(state.faceLandmarker.detectForVideo(video, performance.now()));
         }
     } catch (error) {
         console.error("Prediction error:", error);
     }
 
     state.animationFrameId = requestAnimationFrame(predictLoop);
+}
+
+function processFrame(results) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (results.faceLandmarks.length === 0 || !results.facialTransformationMatrixes?.length) return;
+
+    const landmarks = results.faceLandmarks[0];
+    const irisData = getIrisData(landmarks);
+    drawIrisPoints(irisData.leftCenter, irisData.rightCenter);
+
+    const matrix = results.facialTransformationMatrixes[0].data;
+    const frame = extractFrame(landmarks, matrix, video.videoWidth, video.videoHeight);
+
+    if (state.onFrame) {
+        state.onFrame(frame);
+    } else if (state.model && !state.isCalibrating) {
+        predictGaze(frame);
+    }
 }
 
 function getIrisData(landmarks) {
@@ -200,57 +241,11 @@ function drawIrisPoints(lc, rc) {
     ctx.fill();
 }
 
-/**
- * Removes statistical outliers from an array of calibration samples.
- * This is done for each calibration point's data individually.
- * @param {Array} samples - The array of samples collected for a single point.
- * @returns {Array} - The filtered array of samples with outliers removed.
- */
-function removeOutliers(samples) {
-    // We need a reasonable number of samples to identify outliers
-    if (samples.length < 15) {
-        return samples;
-    }
-
-    // 1. Calculate the center iris position (cx, cy) for each sample
-    const points = samples.map(s => {
-        const cx = (s.iris.rightCenter.x + s.iris.leftCenter.x) / 2;
-        const cy = (s.iris.rightCenter.y + s.iris.leftCenter.y) / 2;
-        return { x: cx, y: cy };
-    });
-
-    // 2. Find the median center point. The median is more robust to outliers than the mean.
-    const sortedX = points.map(p => p.x).sort((a, b) => a - b);
-    const sortedY = points.map(p => p.y).sort((a, b) => a - b);
-    const mid = Math.floor(sortedX.length / 2);
-    const medianX = sortedX.length % 2 === 0 ? (sortedX[mid - 1] + sortedX[mid]) / 2 : sortedX[mid];
-    const medianY = sortedY.length % 2 === 0 ? (sortedY[mid - 1] + sortedY[mid]) / 2 : sortedY[mid];
-
-    // 3. Calculate the Euclidean distance of each point from the median center
-    const distances = points.map(p => Math.sqrt(Math.pow(p.x - medianX, 2) + Math.pow(p.y - medianY, 2)));
-
-    // 4. Calculate the median of these distances (a robust measure of spread)
-    const sortedDistances = [...distances].sort((a, b) => a - b);
-    const medianDistance = sortedDistances.length % 2 === 0 ? (sortedDistances[mid - 1] + sortedDistances[mid]) / 2 : sortedDistances[mid];
-
-    // 5. Define a threshold. A common heuristic is that points with a distance 
-    // more than 3 times the median distance are outliers.
-    // We add a tiny epsilon to prevent a threshold of 0 if all points are identical.
-    const threshold = medianDistance * 3.0 + 1e-6;
-
-    // 6. Filter the original samples, keeping only the ones within the threshold
-    const filteredSamples = samples.filter((_, i) => distances[i] < threshold);
-
-    console.log(`Outlier removal: Kept ${filteredSamples.length} of ${samples.length} samples.`);
-
-    return filteredSamples;
-}
-
 // --- Calibration Logic ---
-async function startCalibration() {
+async function enterOverlay() {
     state.isCalibrating = true;
     updateUI();
-    
+
     try {
         await document.documentElement.requestFullscreen();
     } catch (err) {
@@ -258,37 +253,9 @@ async function startCalibration() {
     }
 
     calOverlay.style.display = 'flex';
-    let collectedData = [];
-    
-    let lastPoint = { x: 0.5, y: 0.5 };
-    placeCalPoint(lastPoint.x, lastPoint.y);
-    calStatus.textContent = "Get ready...";
-    await new Promise(r => setTimeout(r, 2000));
+}
 
-    for (let i = 0; i < CALIBRATION_POINTS.length; i++) {
-        const point = CALIBRATION_POINTS[i];
-        await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
-        // const samples = await collectDataAtPoint(point, i + 1);
-        // collectedData.push(...samples);
-        //remove outliers here
-        const rawSamples = await collectDataAtPoint(point, i + 1);
-        const filteredSamples = removeOutliers(rawSamples);
-        collectedData.push(...filteredSamples);
-        lastPoint = point;
-    }
-    
-    if (collectedData.length > 50) { // Increased threshold due to more points/time
-        const features = collectedData.map(d => getFeatures(d.iris));
-        const targetsX = collectedData.map(d => d.target.x);
-        const targetsY = collectedData.map(d => d.target.y);
-        state.coeffs.x = fitLS(features, targetsX);
-        state.coeffs.y = fitLS(features, targetsY);
-        saveCalibrationModel();
-        updateStatus('Calibration successful!');
-    } else {
-        updateStatus(`Calibration failed: not enough data. (Collected ${collectedData.length})`);
-    }
-    
+function exitOverlay() {
     if (document.fullscreenElement) {
         document.exitFullscreen();
     }
@@ -297,27 +264,115 @@ async function startCalibration() {
     updateUI();
 }
 
-async function collectDataAtPoint(point, pointNumber) {
-    calStatus.textContent = `Hold your gaze (${pointNumber}/${CALIBRATION_POINTS.length})`;
-    await new Promise(r => setTimeout(r, 200));
+async function startCalibration() {
+    await enterOverlay();
+    let lastPoint = { x: 0.5, y: 0.5 };
+    placeCalPoint(lastPoint.x, lastPoint.y);
+    calStatus.textContent = "Sit comfortably. Keep your eyes on the dot.";
+    await wait(2000);
 
-    calPoint.classList.add('collecting');
-    let samples = [];
-    const endTime = performance.now() + HOLD_DURATION_MS;
-    
-    while (performance.now() < endTime) {
-        const results = await state.faceLandmarker.detectForVideo(video, performance.now());
-        if (results.faceLandmarks.length > 0) {
-            samples.push({
-                iris: getIrisData(results.faceLandmarks[0]),
-                target: point
-            });
-        }
-        await new Promise(r => setTimeout(r, 1000 / 30));
+    // Generated here, not at load, so the grid matches the fullscreen aspect ratio.
+    const points = generateCalibrationPoints(CALIBRATION_POINT_COUNT);
+    const gridData = [];
+
+    for (let i = 0; i < points.length; i++) {
+        const point = points[i];
+        calStatus.textContent = "Follow the point";
+        await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
+        calStatus.textContent = `Hold your gaze (${i + 1}/${points.length})`;
+        await wait(SETTLE_DURATION_MS);
+        gridData.push(...await collectSamples(point, HOLD_DURATION_MS));
+        lastPoint = point;
     }
-    
+
+    const headData = [];
+    for (const { point, text } of HEAD_MOVES) {
+        calStatus.textContent = text;
+        await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
+        await wait(READ_DURATION_MS);
+        headData.push(...await collectSamples(point, HEAD_MOVE_DURATION_MS));
+        lastPoint = point;
+    }
+
+    const allData = [...gridData, ...headData];
+    if (allData.length >= MIN_SAMPLES) {
+        state.model = fitModel(allData);
+        state.model.fullscreen = Boolean(document.fullscreenElement);
+        resetFilters();
+        saveCalibrationModel();
+        window.gazeDebug.calibration = allData;
+        updateStatus(describeCalibration(state.model, headData));
+    } else {
+        updateStatus(`Calibration failed: not enough data. (Collected ${allData.length})`);
+    }
+
+    exitOverlay();
+}
+
+// --- Accuracy Test ---
+async function startAccuracyTest() {
+    await enterOverlay();
+    calPoint.classList.add('test');
+    let lastPoint = { x: 0.5, y: 0.5 };
+    placeCalPoint(lastPoint.x, lastPoint.y);
+
+    const results = [];
+    for (const pose of TEST_POSES) {
+        calStatus.textContent = pose.text;
+        await wait(TEST_POSE_DURATION_MS);
+        calStatus.textContent = 'Look at the dot';
+
+        const samples = [];
+        for (const point of TEST_POINTS) {
+            await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
+            await wait(TEST_SETTLE_DURATION_MS);
+            samples.push(...await collectSamples(point, TEST_HOLD_DURATION_MS));
+            lastPoint = point;
+        }
+        results.push({ pose: pose.name, error: medianError(samples), samples });
+    }
+
+    calPoint.classList.remove('test');
+    window.gazeDebug.accuracyTest = results;
+    updateStatus(`Median error, % of screen: ${results.map(r => `${r.pose} ${(r.error * 100).toFixed(1)}`).join(', ')}`);
+    exitOverlay();
+}
+
+function medianError(samples) {
+    const errors = samples.map(({ frame, target }) => {
+        const p = predict(state.model, frame);
+        return Math.hypot(p.x - target.x, p.y - target.y);
+    }).sort((a, b) => a - b);
+    return errors[Math.floor(errors.length / 2)] ?? NaN;
+}
+
+function describeCalibration(model, headData) {
+    const std = (key) => {
+        const values = headData.map(d => d.frame[key]);
+        const mean = values.reduce((a, b) => a + b, 0) / (values.length || 1);
+        return Math.sqrt(values.reduce((a, v) => a + (v - mean) ** 2, 0) / (values.length || 1));
+    };
+    const fit = `Calibrated. Typical fit error ${(model.fitError * 100).toFixed(1)}% of the screen.`;
+    const headMoved = std('tanYaw') >= MIN_HEAD_MOTION.tanYaw || std('tx') >= MIN_HEAD_MOTION.tx;
+    return headMoved ? fit : `${fit} Your head barely moved in the movement steps, so recalibrate if the dot drifts when you move.`;
+}
+
+/** Collects frames for a fixed time, leaving out blinks. */
+async function collectSamples(point, duration) {
+    const frames = [];
+    state.onFrame = (frame) => frames.push(frame);
+    calPoint.classList.add('collecting');
+    await wait(duration);
     calPoint.classList.remove('collecting');
-    return samples;
+    state.onFrame = null;
+
+    const ears = frames.map(f => f.ear).sort((a, b) => a - b);
+    const minEar = ears[Math.floor(ears.length / 2)] * OPEN_EYE_RATIO;
+    return frames.filter(f => f.ear >= minEar).map(frame => ({ frame, target: point }));
+}
+
+function wait(ms) {
+    return new Promise(r => setTimeout(r, ms));
 }
 
 function placeCalPoint(normX, normY) {
@@ -327,7 +382,6 @@ function placeCalPoint(normX, normY) {
 
 async function animatePointTransition(from, to, duration) {
     const start = performance.now();
-    calStatus.textContent = "Follow the point";
 
     return new Promise(resolve => {
         function frame() {
@@ -348,50 +402,53 @@ async function animatePointTransition(from, to, duration) {
 }
 
 // --- Gaze Prediction ---
-function predictGaze(irisData) {
-    const f = getFeatures(irisData);
-    let px = Math.max(0, Math.min(1, dot(f, state.coeffs.x)));
-    let py = Math.max(0, Math.min(1, dot(f, state.coeffs.y)));
+function predictGaze(frame) {
+    if (isBlink(frame, state.model)) return; // Hold the dot; the iris landmarks jump during a blink.
 
-    state.lastPrediction.x = state.lastPrediction.x * (1 - SMOOTHING_ALPHA) + px * SMOOTHING_ALPHA;
-    state.lastPrediction.y = state.lastPrediction.y * (1 - SMOOTHING_ALPHA) + py * SMOOTHING_ALPHA;
-    
-    const stage = document.getElementById('stage');
-    gazeDot.style.left = `${state.lastPrediction.x * window.innerWidth}px`;
-    gazeDot.style.top = `${state.lastPrediction.y * window.innerHeight}px`;
+    const raw = predict(state.model, frame);
+    const now = performance.now() / 1000;
+    const { left, top } = toViewport({
+        x: state.filters.x.filter(raw.x, now),
+        y: state.filters.y.filter(raw.y, now)
+    });
+    gazeDot.style.left = `${left}px`;
+    gazeDot.style.top = `${top}px`;
 }
 
-// --- Mathematical Model (Polynomial Regression) ---
-// --- MODIFIED FOR ACCURACY: Upgraded to a 3rd order (cubic) polynomial model ---
-function getFeatures({ rightCenter, leftCenter }) {
-    const cx = (rightCenter.x + leftCenter.x) / 2;
-    const cy = (rightCenter.y + leftCenter.y) / 2;
-    // Added cubic terms for a more complex model
-    return [
-        1, cx, cy, 
-        cx * cx, cy * cy, cx * cy,
-        cx * cx * cx, cy * cy * cy, cx * cx * cy, cx * cy * cy
-    ];
+function resetFilters() {
+    state.filters.x.reset();
+    state.filters.y.reset();
 }
-function dot(a, b) { return a.reduce((sum, val, i) => sum + val * b[i], 0); }
-function transpose(A) { return A[0].map((_, i) => A.map(row => row[i])); }
-function matMul(A, B) { const m = A.length, p = A[0].length, n = B[0].length, C = Array.from({ length: m }, () => Array(n).fill(0)); for (let i = 0; i < m; i++) for (let k = 0; k < p; k++) { const v = A[i][k]; for (let j = 0; j < n; j++) C[i][j] += v * B[k][j]; } return C; }
-function solveLinear(Aorig, borig) { const n = Aorig.length, M = Aorig.map(r => r.slice()), b = borig.slice(); for (let i = 0; i < n; i++) { let p = i; for (let r = i + 1; r < n; r++) if (Math.abs(M[r][i]) > Math.abs(M[p][i])) p = r; [M[i], M[p]] = [M[p], M[i]]; [b[i], b[p]] = [b[p], b[i]]; let d = M[i][i]; if (Math.abs(d) < 1e-12) M[i][i] += 1e-8; const inv = 1 / M[i][i]; for (let j = i; j < n; j++) M[i][j] *= inv; b[i] *= inv; for (let r = 0; r < n; r++) if (r !== i) { const f = M[r][i]; for (let c = i; c < n; c++) M[r][c] -= f * M[i][c]; b[r] -= f * b[i]; } } return b; }
-function fitLS(Arows, targets) { const A = Arows, At = transpose(A), AtA = matMul(At, A), Aty = matMul(At, targets.map(v => [v])), rhs = Aty.map(r => r[0]); return solveLinear(AtA, rhs); }
+
+/**
+ * Converts a gaze point to page coordinates. Calibration usually runs fullscreen, so its 0-1 range
+ * spans the monitor, while tracking usually runs in a window that may be smaller or offset.
+ */
+function toViewport({ x, y }) {
+    const clamp = (v, max) => Math.max(0, Math.min(max, v));
+    if (!state.model.fullscreen) {
+        return { left: clamp(x * window.innerWidth, window.innerWidth), top: clamp(y * window.innerHeight, window.innerHeight) };
+    }
+    const originX = window.screenX - (screen.availLeft ?? 0) + (window.outerWidth - window.innerWidth) / 2;
+    const originY = window.screenY - (screen.availTop ?? 0) + window.outerHeight - window.innerHeight;
+    return {
+        left: clamp(x * screen.width - originX, window.innerWidth),
+        top: clamp(y * screen.height - originY, window.innerHeight)
+    };
+}
 
 // --- Local Storage ---
-// --- MODIFIED to avoid conflict with the old model ---
-const MODEL_STORAGE_KEY = 'gaze_poly_model_v3_slow';
+const MODEL_STORAGE_KEY = 'gaze_head_model_v4';
 
 function saveCalibrationModel() {
-    localStorage.setItem(MODEL_STORAGE_KEY, JSON.stringify(state.coeffs));
+    localStorage.setItem(MODEL_STORAGE_KEY, JSON.stringify(state.model));
 }
 
 function loadCalibrationModel() {
     try {
         const data = JSON.parse(localStorage.getItem(MODEL_STORAGE_KEY));
-        if (data && data.x && data.y) {
-            state.coeffs = data;
+        if (data && data.wx && data.wy) {
+            state.model = data;
             updateStatus('Loaded saved calibration.');
             return true;
         }
@@ -402,7 +459,7 @@ function loadCalibrationModel() {
 
 function clearCalibrationModel() {
     localStorage.removeItem(MODEL_STORAGE_KEY);
-    state.coeffs = { x: null, y: null };
+    state.model = null;
     updateStatus('Calibration data cleared.');
     updateUI();
 }
@@ -412,6 +469,7 @@ function addEventListeners() {
     toggleVideoBtn.addEventListener('click', toggleCamera);
     startCalBtn.addEventListener('click', startCalibration);
     clearCalBtn.addEventListener('click', clearCalibrationModel);
+    testBtn.addEventListener('click', startAccuracyTest);
 }
 
 function updateStatus(text) {
@@ -421,10 +479,11 @@ function updateStatus(text) {
 function updateUI() {
     toggleVideoBtn.textContent = state.isCameraOn ? 'Stop Video' : 'Start Video';
     startCalBtn.disabled = !state.isCameraOn || state.isCalibrating;
-    
-    const hasModel = state.coeffs.x && state.coeffs.y;
-    gazeDot.style.display = (hasModel && state.isCameraOn && !state.isCalibrating) ? 'block' : 'none';
+    testBtn.disabled = !state.isCameraOn || state.isCalibrating || !state.model;
+
+    gazeDot.style.display = (state.model && state.isCameraOn && !state.isCalibrating) ? 'block' : 'none';
 }
 
 // --- Start the App ---
+window.gazeDebug = {}; // Numbers only, never images: last calibration and test samples, for analysis.
 initialize();
