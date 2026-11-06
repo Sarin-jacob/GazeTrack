@@ -1,7 +1,7 @@
 // main.js - Camera, calibration flow and UI. The gaze maths lives in gaze-model.js.
 
 import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
-import { RIGHT_IRIS, LEFT_IRIS, extractFrame, fitModel, fitHeadModel, predict, isBlink, toViewport, Pointer } from "./gaze-model.js";
+import { RIGHT_IRIS, LEFT_IRIS, GRID_WEIGHT, extractFrame, fitModel, fitHeadModel, predict, isBlink, toViewport, Pointer } from "./gaze-model.js";
 import { isCaptureAvailable, startCapture, stopCapture, logEvent, logFrame } from "./capture.js";
 const { FaceLandmarker, FilesetResolver } = vision;
 
@@ -416,7 +416,7 @@ async function startCalibration() {
         }
     }
 
-    const allData = [...gridData, ...noseData, ...headData, ...holdData];
+    const allData = [...gridData.map(s => ({ ...s, weight: GRID_WEIGHT })), ...noseData, ...headData, ...holdData];
     if (allData.length >= MIN_SAMPLES) {
         calStatus.textContent = 'Building your model...';
         await wait(100); // Let the label paint; fitting holds the page for a few seconds.

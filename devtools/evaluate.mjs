@@ -1,10 +1,10 @@
-// Scores gaze-model.js on real recordings: fits on the newest calibration in captures/ and tests
-// on the runs recorded after it. Run with: node devtools/evaluate.mjs
+// Scores gaze-model.js on real recordings: fits on each calibration in captures/, then tests on its
+// held-out grid dots and on the test runs recorded after it. Run with: node devtools/evaluate.mjs
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { extractFrame, fitModel, fitHeadModel, predict } from '../gaze-model.js';
+import { GRID_WEIGHT, extractFrame, fitModel, predict } from '../gaze-model.js';
 
 const VIDEO_WIDTH = 1280;
 const VIDEO_HEIGHT = 720;
@@ -45,26 +45,39 @@ function segments(folder) {
 }
 
 const names = fs.readdirSync(captures).filter(n => fs.existsSync(path.join(captures, n, 'landmarks.bin'))).sort();
-const calibration = names.filter(n => n.includes('calibration') && names.some(t => t.includes('test') && t > n)).at(-1);
-const calSegments = segments(path.join(captures, calibration));
-const samples = calSegments.flatMap(s => s.frames.map(frame => ({ frame, target: s.point })));
+const calibrations = names.filter(n => n.includes('calibration'));
 
-const started = performance.now();
-const model = fitModel(samples);
-console.log(`Fitted on ${calibration}: ${samples.length} samples in ${((performance.now() - started) / 1000).toFixed(1)} s, stored size ${(JSON.stringify(model).length / 1024).toFixed(0)} KB`);
-model.head = fitHeadModel(calSegments.filter(s => s.phase === 'nose').flatMap(s => s.frames.map(frame => ({ frame, target: s.point }))));
+const toSamples = (segs) => segs.flatMap(s => s.frames.map(frame => ({ frame, target: s.point, weight: s.phase === 'grid' ? GRID_WEIGHT : 1 })));
+const dotError = (model, { point, frames }) => {
+    const predictions = frames.map(f => predict(model, f));
+    return Math.hypot(median(predictions.map(p => p.x)) - point.x, median(predictions.map(p => p.y)) - point.y);
+};
+const percent = (v) => (v * 100).toFixed(1);
 
-const allErrors = [];
-for (const name of names.filter(n => n.includes('test') && n > calibration)) {
-    const byPose = {};
-    for (const { phase, point, frames } of segments(path.join(captures, name))) {
-        if (!phase.startsWith('test-')) continue;
-        const predictions = frames.map(f => predict(model, f));
-        const error = Math.hypot(median(predictions.map(p => p.x)) - point.x, median(predictions.map(p => p.y)) - point.y);
-        (byPose[phase.slice(5)] ??= []).push(error);
-        allErrors.push(error);
+const heldOutErrors = [];
+const testErrors = [];
+calibrations.forEach((calibration, i) => {
+    const calSegments = segments(path.join(captures, calibration));
+
+    // Half the grid dots are kept out of the fit, to score natural viewing on unseen dots.
+    const held = calSegments.filter(s => s.phase === 'grid').filter((_, n) => n % 2 === 1);
+    const partial = fitModel(toSamples(calSegments.filter(s => !held.includes(s))));
+    const errors = held.map(s => dotError(partial, s));
+    heldOutErrors.push(...errors);
+    console.log(`${calibration}: held-out grid dots ${percent(median(errors))}`);
+
+    const model = fitModel(toSamples(calSegments));
+    const next = calibrations[i + 1] ?? '~';
+    for (const name of names.filter(n => n.includes('test') && n > calibration && n < next)) {
+        const byPose = {};
+        for (const segment of segments(path.join(captures, name))) {
+            if (!segment.phase.startsWith('test-')) continue;
+            const error = dotError(model, segment);
+            (byPose[segment.phase.slice(5)] ??= []).push(error);
+            testErrors.push(error);
+        }
+        console.log(`  ${name}: ${Object.entries(byPose).map(([pose, e]) => `${pose} ${percent(median(e))}`).join(', ')}`);
     }
-    const line = Object.entries(byPose).map(([pose, e]) => `${pose} ${(median(e) * 100).toFixed(1)}`).join(', ');
-    console.log(`${name}: ${line}`);
-}
-console.log(`Median error across all test dots: ${(median(allErrors) * 100).toFixed(1)}% of the screen`);
+});
+const worst = [...testErrors].sort((a, b) => a - b)[Math.floor(testErrors.length * 0.9)];
+console.log(`Median error, % of the screen: held-out grid dots ${percent(median(heldOutErrors))}, test dots ${percent(median(testErrors))}, worst tenth of test dots ${percent(worst)} or more`);

@@ -1,10 +1,12 @@
 // gaze-model.js - Head-pose-aware gaze model. No DOM here, so it also runs under Node (see devtools/).
 //
 // The screen point you look at depends on two things: where the eye points inside the head, and
-// where the head is. Two models estimate that in different ways, and their average is the
-// prediction. On real recordings they make different mistakes, so the average beats either one.
+// where the head is. Two models estimate that in different ways, and the prediction blends them.
+// On real recordings they make different mistakes, so the blend beats either one.
 //   geometric: a few hand-built terms for a ray from the eye to the screen.
 //   shape:     every face landmark, in the head's own frame, reduced to its main patterns.
+// A calibration only works for the session it was made in: pooling several sessions did not beat
+// a fresh one, because how you sit that day matters more than how much history there is.
 // Both are linear and are fitted during calibration. They can only learn what head movement does
 // if the head moved, which is why calibration has head-movement steps.
 
@@ -18,6 +20,9 @@ const GEOMETRIC_RIDGE = 30;
 const SHAPE_RIDGE = 10;
 const SHAPE_COMPONENTS = 40;
 const SUBSPACE_ITERATIONS = 3;
+// These two were tuned on five real sessions, choosing on four and scoring on the fifth.
+const SHAPE_BLEND = 0.9; // Share of the shape model. Alone it fails on some poses, so keep both.
+export const GRID_WEIGHT = 5; // Grid dots show natural viewing, which matters most, so count them more.
 const TRIM_PASSES = 2;
 const TRIM_MAD_FACTOR = 3.5; // Samples further than this many MADs from the fit are dropped.
 const BLINK_EAR_RATIO = 0.7;
@@ -181,18 +186,25 @@ function mainSubspace(Z, n, d, k) {
  * Standardizes the features, optionally reduces them to their main patterns, and fits ridge
  * regression. It is all linear, so the result folds down to one weight per raw feature.
  */
-function fitLinear(rows, targets, ridge, components = 0) {
+function fitLinear(rows, targets, weights, ridge, components = 0) {
     const n = rows.length;
     const d = rows[0].length;
+    const total = weights.reduce((a, w) => a + w, 0);
     const mean = new Float64Array(d);
     const std = new Float64Array(d);
-    for (const row of rows) for (let j = 0; j < d; j++) mean[j] += row[j] / n;
-    for (const row of rows) for (let j = 0; j < d; j++) std[j] += (row[j] - mean[j]) ** 2 / n;
+    rows.forEach((row, i) => {
+        for (let j = 0; j < d; j++) mean[j] += weights[i] * row[j] / total;
+    });
+    rows.forEach((row, i) => {
+        for (let j = 0; j < d; j++) std[j] += weights[i] * (row[j] - mean[j]) ** 2 / total;
+    });
     for (let j = 0; j < d; j++) std[j] = Math.sqrt(std[j]) || 1;
 
+    // Scaling a row by the root of its weight has the same effect as repeating it that many times.
+    const roots = weights.map(Math.sqrt);
     const Z = new Float64Array(n * d);
     rows.forEach((row, i) => {
-        for (let j = 0; j < d; j++) Z[i * d + j] = (row[j] - mean[j]) / std[j];
+        for (let j = 0; j < d; j++) Z[i * d + j] = roots[i] * (row[j] - mean[j]) / std[j];
     });
 
     const k = components || d;
@@ -207,16 +219,16 @@ function fitLinear(rows, targets, ridge, components = 0) {
         }
     }
 
-    const biasX = targets.reduce((a, t) => a + t.x, 0) / n;
-    const biasY = targets.reduce((a, t) => a + t.y, 0) / n;
+    const biasX = targets.reduce((a, t, i) => a + weights[i] * t.x, 0) / total;
+    const biasY = targets.reduce((a, t, i) => a + weights[i] * t.y, 0) / total;
     const A = Array.from({ length: k }, () => new Array(k).fill(0));
     const rhsX = new Array(k).fill(0);
     const rhsY = new Array(k).fill(0);
     for (let i = 0; i < n; i++) {
         for (let a = 0; a < k; a++) {
             const v = scores[i * k + a];
-            rhsX[a] += v * (targets[i].x - biasX);
-            rhsY[a] += v * (targets[i].y - biasY);
+            rhsX[a] += v * roots[i] * (targets[i].x - biasX);
+            rhsY[a] += v * roots[i] * (targets[i].y - biasY);
             for (let b = a; b < k; b++) A[a][b] += v * scores[i * k + b];
         }
     }
@@ -254,7 +266,9 @@ function applyLinear(model, features) {
 function fitTrimmed(samples, featuresOf, ridge, components) {
     const rows = samples.map(s => featuresOf(s.frame));
     let kept = samples.map((_, i) => i);
-    const fit = () => fitLinear(kept.map(i => rows[i]), kept.map(i => samples[i].target), ridge, components);
+    const fit = () => fitLinear(
+        kept.map(i => rows[i]), kept.map(i => samples[i].target), kept.map(i => samples[i].weight ?? 1), ridge, components
+    );
 
     let model = fit();
     for (let pass = 0; pass < TRIM_PASSES; pass++) {
@@ -273,7 +287,7 @@ function fitTrimmed(samples, featuresOf, ridge, components) {
 
 /**
  * Fits both models.
- * @param {Array<{frame: object, target: {x: number, y: number}}>} samples
+ * @param {Array<{frame: object, target: {x: number, y: number}, weight?: number}>} samples
  * @returns {object} A JSON-serializable model.
  */
 export function fitModel(samples) {
@@ -296,7 +310,10 @@ export function fitModel(samples) {
 export function predict(model, frame) {
     const a = applyLinear(model.geometric, geometricFeatures(frame));
     const b = applyLinear(model.shape, shapeFeatures(frame));
-    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    return {
+        x: a.x + SHAPE_BLEND * (b.x - a.x),
+        y: a.y + SHAPE_BLEND * (b.y - a.y)
+    };
 }
 
 export function isBlink(frame, model) {
