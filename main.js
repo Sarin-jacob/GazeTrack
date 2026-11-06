@@ -55,12 +55,14 @@ const MIN_NOSE_SAMPLES = 40;
 const OPEN_EYE_RATIO = 0.7; // Frames this far under a point's typical eye openness are blinks.
 const GUIDE_RADIUS_PX = 90;
 const PIP_REACH = 0.45; // How close the marker must get to a ring, in guide radii.
+const FULL_TRAVEL_REACH = 0.2; // For leaning, where the model needs the whole range of movement.
 
 const CALIBRATION_INTRO = [
     'Turn your sound on. A voice tells you what to do, so you never need to look away to read.',
     'First, follow the yellow dot with your eyes.',
     'Then point your nose at the dot.',
-    'Last, keep your eyes on the dot and move your head. A small white marker follows your head. Steer it onto the rings around the dot.'
+    'Then keep your eyes on the dot and move your head. A small white marker follows your head. Steer it onto the rings around the dot.',
+    'Last, hold your head at a ring and follow the dot with your eyes, keeping your head still.'
 ];
 const TEST_INTRO = [
     'Turn your sound on. A voice tells you what to do.',
@@ -89,9 +91,19 @@ const HEAD_STEPS = [
     { point: { x: 0.5, y: 0.5 }, axis: 'turn', pips: SIDES, speech: 'Eyes on the dot. Turn your head to touch each ring.', label: 'Turn your head' },
     { point: { x: 0.15, y: 0.15 }, axis: 'slide', pips: SIDES, speech: 'Eyes on the dot. Now slide your head without turning it.', label: 'Slide your head' },
     { point: { x: 0.85, y: 0.15 }, axis: 'turn', pips: SIDES, speech: 'Turn your head again.', label: 'Turn your head' },
-    { point: { x: 0.85, y: 0.85 }, axis: 'lean', pips: [[0, -1], [0, 1]], speech: 'Lean in, then lean back.', label: 'Lean in and back' },
-    { point: { x: 0.15, y: 0.85 }, axis: 'slide', pips: SIDES, speech: 'Last one. Slide your head again.', label: 'Slide your head' }
+    { point: { x: 0.85, y: 0.85 }, axis: 'lean', pips: [[0, -1], [0, 1]], reach: FULL_TRAVEL_REACH, speech: 'Lean in, then lean back.', label: 'Lean in and back' },
+    { point: { x: 0.15, y: 0.85 }, axis: 'slide', pips: SIDES, speech: 'Slide your head again.', label: 'Slide your head' }
 ];
+
+// Recordings showed lean and turn errors were steady offsets the head steps did not teach, because
+// those steps look at one dot. So hold each pose and look at dots on both sides of the screen.
+// These dots stay clear of TEST_POINTS, so the accuracy test still uses points it was not fitted to.
+const HOLD_STEPS = [
+    { axis: 'lean', pips: [[0, 1]], reach: FULL_TRAVEL_REACH, speech: 'Lean in to the ring.', label: 'Lean in' },
+    { axis: 'lean', pips: [[0, -1]], reach: FULL_TRAVEL_REACH, speech: 'Lean back to the ring.', label: 'Lean back' },
+    { axis: 'turn', pips: [[1, 0]], speech: 'Turn your head to the ring.', label: 'Turn your head' }
+];
+const HOLD_POINTS = [{ x: 0.2, y: 0.2 }, { x: 0.8, y: 0.8 }];
 
 // Accuracy test: look at known points with the head held in different places. The points are
 // off the calibration grid, so this measures the model on data it was not fitted to.
@@ -387,7 +399,24 @@ async function startCalibration() {
         lastPoint = step.point;
     }
 
-    const allData = [...gridData, ...noseData, ...headData];
+    const holdData = [];
+    for (const step of HOLD_STEPS) {
+        const center = { x: 0.5, y: 0.5 };
+        await animatePointTransition(lastPoint, center, TRANSITION_DURATION_MS);
+        await say(step.speech, step.label);
+        const { samples } = await steerHead({ point: center, ...step }, rest, TEST_STEP_TIMEOUT_MS);
+        holdData.push(...samples);
+        await say('Hold that, and follow the dot.', 'Hold still');
+        lastPoint = center;
+        for (const point of HOLD_POINTS) {
+            await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
+            await wait(SETTLE_DURATION_MS);
+            holdData.push(...await collectSamples(point, HOLD_DURATION_MS, `hold-${step.axis}`));
+            lastPoint = point;
+        }
+    }
+
+    const allData = [...gridData, ...noseData, ...headData, ...holdData];
     if (allData.length >= MIN_SAMPLES) {
         calStatus.textContent = 'Building your model...';
         await wait(100); // Let the label paint; fitting holds the page for a few seconds.
@@ -429,7 +458,7 @@ function restPose(samples) {
  * out. The rings are close enough to the dot that the eyes can stay put, and they are centred on
  * the rest pose, not the head's position right now, so every ring stays reachable.
  */
-async function steerHead({ point, axis, pips }, rest, timeout) {
+async function steerHead({ point, axis, pips, reach = PIP_REACH }, rest, timeout) {
     const read = HEAD_AXES[axis];
     const origin = read(rest);
     const rings = pips.map(([u, v]) => {
@@ -449,7 +478,7 @@ async function steerHead({ point, axis, pips }, rest, timeout) {
         headMarker.style.left = `calc(50% + ${Math.max(-1.3, Math.min(1.3, u)) * GUIDE_RADIUS_PX}px)`;
         headMarker.style.top = `calc(50% + ${-Math.max(-1.3, Math.min(1.3, v)) * GUIDE_RADIUS_PX}px)`;
         for (const r of rings) {
-            if (!r.hit && Math.hypot(u - r.u, v - r.v) < PIP_REACH) {
+            if (!r.hit && Math.hypot(u - r.u, v - r.v) < reach) {
                 r.hit = true;
                 r.ring.classList.add('hit');
             }

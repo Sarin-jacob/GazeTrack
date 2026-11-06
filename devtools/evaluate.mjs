@@ -45,7 +45,7 @@ function segments(folder) {
 }
 
 const names = fs.readdirSync(captures).filter(n => fs.existsSync(path.join(captures, n, 'landmarks.bin'))).sort();
-const calibration = names.filter(n => n.includes('calibration')).at(-1);
+const calibration = names.filter(n => n.includes('calibration') && names.some(t => t.includes('test') && t > n)).at(-1);
 const calSegments = segments(path.join(captures, calibration));
 const samples = calSegments.flatMap(s => s.frames.map(frame => ({ frame, target: s.point })));
 
