@@ -260,7 +260,7 @@ function processFrame(results) {
         if (!state.isCalibrating) placeGazeDot(frame.pointer);
     }
 
-    logFrame(frame);
+    logFrame(frame, landmarks, matrix);
     state.onFrame?.(frame);
 }
 
@@ -389,6 +389,8 @@ async function startCalibration() {
 
     const allData = [...gridData, ...noseData, ...headData];
     if (allData.length >= MIN_SAMPLES) {
+        calStatus.textContent = 'Building your model...';
+        await wait(100); // Let the label paint; fitting holds the page for a few seconds.
         state.model = fitModel(allData);
         state.model.head = noseData.length >= MIN_NOSE_SAMPLES ? fitHeadModel(noseData) : null;
         state.model.fullscreen = Boolean(document.fullscreenElement);
@@ -590,7 +592,7 @@ function toViewport({ x, y }) {
 }
 
 // --- Local Storage ---
-const MODEL_STORAGE_KEY = 'gaze_head_model_v5';
+const MODEL_STORAGE_KEY = 'gaze_head_model_v6';
 
 function saveCalibrationModel() {
     localStorage.setItem(MODEL_STORAGE_KEY, JSON.stringify(state.model));
@@ -599,7 +601,7 @@ function saveCalibrationModel() {
 function loadCalibrationModel() {
     try {
         const data = JSON.parse(localStorage.getItem(MODEL_STORAGE_KEY));
-        if (data && data.wx && data.wy) {
+        if (data && data.geometric && data.shape) {
             state.model = data;
             updateStatus('Loaded saved calibration.');
             return true;

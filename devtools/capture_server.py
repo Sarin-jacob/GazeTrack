@@ -6,6 +6,7 @@ Captures hold webcam video of your face, so this binds to this machine only and 
 gitignored. The app only talks to this server on localhost, so the Pages site never records.
 """
 
+import json
 import re
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CAPTURES = ROOT / "captures"
 HOST, PORT = "127.0.0.1", 8765
 MAX_UPLOAD_BYTES = 1024 * 1024 * 1024
-UPLOAD_PATH = re.compile(r"^/capture/([\w.-]+)/(session\.json|video\.webm)$")
+UPLOAD_PATH = re.compile(r"^/capture/([\w.-]+)/(session\.json|video\.webm|landmarks\.bin)$")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -24,9 +25,20 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):
+        upload = UPLOAD_PATH.match(self.path)
         if self.path == "/capture/ping":
             self.send_response(204)
             self.end_headers()
+        elif self.path == "/capture/list":
+            names = sorted(p.name for p in CAPTURES.iterdir()) if CAPTURES.exists() else []
+            body = json.dumps(names).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        elif upload:
+            self.path = f"/captures/{upload[1]}/{upload[2]}"
+            super().do_GET()
         elif self.path.startswith("/captures"):
             self.send_error(404)
         else:

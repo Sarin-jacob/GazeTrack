@@ -1,20 +1,23 @@
-// gaze-model.js - Head-pose-aware gaze model. No DOM here, so it also runs under Node (see sim/).
+// gaze-model.js - Head-pose-aware gaze model. No DOM here, so it also runs under Node (see devtools/).
 //
-// The screen point you look at depends on two things: where the eye points inside the head,
-// and where the head is. So each frame is reduced to:
-//   ex, ey            iris offset from the eye centre, in the head's own frame, in eye-widths.
-//                     Moving, scaling or rolling the head in the image does not change these.
-//   tanYaw, tanPitch  where the head is facing.
-//   tx, ty, dist      where the head is, in cm from the camera.
-// A ridge regression maps those to screen coordinates. Its head terms can only be learned if
-// the head moved during calibration, which is why calibration has a head-movement phase.
+// The screen point you look at depends on two things: where the eye points inside the head, and
+// where the head is. Two models estimate that in different ways, and their average is the
+// prediction. On real recordings they make different mistakes, so the average beats either one.
+//   geometric: a few hand-built terms for a ray from the eye to the screen.
+//   shape:     every face landmark, in the head's own frame, reduced to its main patterns.
+// Both are linear and are fitted during calibration. They can only learn what head movement does
+// if the head moved, which is why calibration has head-movement steps.
 
 export const RIGHT_IRIS = [469, 470, 471, 472];
 export const LEFT_IRIS = [474, 475, 476, 477];
 const RIGHT_EYE = { outer: 33, inner: 133, top: 159, bottom: 145 };
 const LEFT_EYE = { outer: 263, inner: 362, top: 386, bottom: 374 };
+const LANDMARK_COUNT = 478;
 
-const RIDGE_LAMBDA = 1e-3;
+const GEOMETRIC_RIDGE = 30;
+const SHAPE_RIDGE = 10;
+const SHAPE_COMPONENTS = 40;
+const SUBSPACE_ITERATIONS = 3;
 const TRIM_PASSES = 2;
 const TRIM_MAD_FACTOR = 3.5; // Samples further than this many MADs from the fit are dropped.
 const BLINK_EAR_RATIO = 0.7;
@@ -56,8 +59,30 @@ function eyeInHead(landmarks, irisIndices, eye, axes, width, height) {
     };
 }
 
+// Every landmark in the head's frame, scaled by the distance between the eyes, so moving, turning
+// or leaning only changes the head values appended at the end.
+function faceShape(landmarks, axes, forward, head, width, height) {
+    const outerRight = toCamera(landmarks[RIGHT_EYE.outer], width, height);
+    const outerLeft = toCamera(landmarks[LEFT_EYE.outer], width, height);
+    const center = mid(
+        mid(outerRight, toCamera(landmarks[RIGHT_EYE.inner], width, height)),
+        mid(outerLeft, toCamera(landmarks[LEFT_EYE.inner], width, height))
+    );
+    const scale = 1 / norm(sub(outerRight, outerLeft));
+
+    const shape = new Float32Array(LANDMARK_COUNT * 3 + head.length);
+    for (let i = 0; i < LANDMARK_COUNT; i++) {
+        const p = sub(toCamera(landmarks[i], width, height), center);
+        shape[i * 3] = (p[0] * axes.right[0] + p[1] * axes.right[1] + p[2] * axes.right[2]) * scale;
+        shape[i * 3 + 1] = (p[0] * axes.up[0] + p[1] * axes.up[1] + p[2] * axes.up[2]) * scale;
+        shape[i * 3 + 2] = (p[0] * forward[0] + p[1] * forward[1] + p[2] * forward[2]) * scale;
+    }
+    shape.set(head, LANDMARK_COUNT * 3);
+    return shape;
+}
+
 /**
- * Reduces one MediaPipe result to the values the model uses.
+ * Reduces one MediaPipe result to the values the models use.
  * @param {Array} landmarks - Normalized face landmarks.
  * @param {ArrayLike<number>} matrix - Column-major 4x4 facial transformation matrix (cm).
  * @param {number} width - Video width in pixels.
@@ -73,45 +98,34 @@ export function extractFrame(landmarks, matrix, width, height) {
     const right = eyeInHead(landmarks, RIGHT_IRIS, RIGHT_EYE, axes, width, height);
     const left = eyeInHead(landmarks, LEFT_IRIS, LEFT_EYE, axes, width, height);
 
+    const tanYaw = forward[0] / forward[2];
+    const tanPitch = forward[1] / forward[2];
+    const roll = Math.atan2(matrix[1], matrix[0]);
+    const tx = matrix[12];
+    const ty = matrix[13];
+    const dist = -matrix[14];
+
     return {
-        // The eyes are mirror images, so `x` means "towards the nose" on one and "away" on the
-        // other only if measured per eye. Both are in the head's frame here, so averaging is safe.
         ex: (right.x + left.x) / 2,
         ey: (right.y + left.y) / 2,
-        tanYaw: forward[0] / forward[2],
-        tanPitch: forward[1] / forward[2],
-        tx: matrix[12],
-        ty: matrix[13],
-        dist: -matrix[14],
-        ear: (right.openness + left.openness) / 2
+        tanYaw, tanPitch, roll, tx, ty, dist,
+        ear: (right.openness + left.openness) / 2,
+        shape: faceShape(landmarks, axes, forward, [tanYaw, tanPitch, roll, tx, ty, dist], width, height)
     };
 }
 
-function rawFeatures({ ex, ey, tanYaw, tanPitch, tx, ty, dist }) {
-    // The same eye rotation sweeps further across the screen from further away, and the head
-    // terms scale the same way. That is what the products with `dist` capture.
+// The same eye rotation sweeps further across the screen from further away, so the eye terms are
+// scaled by distance. Turning and sliding the head are tied together in one ray to the screen.
+function geometricFeatures({ ex, ey, tanYaw, tanPitch, tx, ty, dist }) {
     return [
-        ex, ey, ex * ex, ey * ey, ex * ey,
-        tanYaw, tanPitch, tx, ty, dist,
-        dist * ex, dist * ey, dist * tanYaw, dist * tanPitch
+        tx + dist * tanYaw, ty + dist * tanPitch, dist,
+        dist * ex, dist * ey, dist * ex * ex, dist * ey * ey, dist * ex * ey
     ];
 }
 
-function standardize(row, mean, std) {
-    return row.map((v, i) => (v - mean[i]) / std[i]);
-}
+const shapeFeatures = (frame) => frame.shape;
 
-function transpose(A) { return A[0].map((_, i) => A.map(row => row[i])); }
-function matMul(A, B) { const m = A.length, p = A[0].length, n = B[0].length, C = Array.from({ length: m }, () => Array(n).fill(0)); for (let i = 0; i < m; i++) for (let k = 0; k < p; k++) { const v = A[i][k]; for (let j = 0; j < n; j++) C[i][j] += v * B[k][j]; } return C; }
 function solveLinear(Aorig, borig) { const n = Aorig.length, M = Aorig.map(r => r.slice()), b = borig.slice(); for (let i = 0; i < n; i++) { let p = i; for (let r = i + 1; r < n; r++) if (Math.abs(M[r][i]) > Math.abs(M[p][i])) p = r; [M[i], M[p]] = [M[p], M[i]]; [b[i], b[p]] = [b[p], b[i]]; let d = M[i][i]; if (Math.abs(d) < 1e-12) M[i][i] += 1e-8; const inv = 1 / M[i][i]; for (let j = i; j < n; j++) M[i][j] *= inv; b[i] *= inv; for (let r = 0; r < n; r++) if (r !== i) { const f = M[r][i]; for (let c = i; c < n; c++) M[r][c] -= f * M[i][c]; b[r] -= f * b[i]; } } return b; }
-
-function fitRidge(rows, targets) {
-    const At = transpose(rows);
-    const AtA = matMul(At, rows);
-    for (let i = 0; i < AtA.length; i++) AtA[i][i] += RIDGE_LAMBDA * rows.length;
-    const rhs = matMul(At, targets.map(v => [v])).map(r => r[0]);
-    return solveLinear(AtA, rhs);
-}
 
 function median(values) {
     const s = [...values].sort((a, b) => a - b);
@@ -119,61 +133,170 @@ function median(values) {
     return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 }
 
-function fitOnce(samples) {
-    const raw = samples.map(s => rawFeatures(s.frame));
-    const cols = transpose(raw);
-    const mean = cols.map(c => c.reduce((a, b) => a + b, 0) / c.length);
-    const std = cols.map((c, i) => Math.sqrt(c.reduce((a, v) => a + (v - mean[i]) ** 2, 0) / c.length) || 1);
-    const rows = raw.map(r => standardize(r, mean, std));
+/**
+ * Finds an orthonormal basis of the main directions of variation in Z (n rows of d values).
+ * A basis is enough, without the individual components, because ridge regression gives the same
+ * predictions in any rotation of it. Seeded, so a calibration always gives the same result.
+ */
+function mainSubspace(Z, n, d, k) {
+    let seed = 1;
+    const Q = new Float64Array(d * k);
+    for (let i = 0; i < Q.length; i++) {
+        seed = (seed * 1664525 + 1013904223) >>> 0;
+        Q[i] = seed / 2 ** 32 - 0.5;
+    }
 
-    const xs = samples.map(s => s.target.x);
-    const ys = samples.map(s => s.target.y);
-    const biasX = xs.reduce((a, b) => a + b, 0) / xs.length;
-    const biasY = ys.reduce((a, b) => a + b, 0) / ys.length;
-
-    return {
-        mean, std, biasX, biasY,
-        wx: fitRidge(rows, xs.map(v => v - biasX)),
-        wy: fitRidge(rows, ys.map(v => v - biasY))
-    };
+    const Y = new Float64Array(n * k);
+    for (let pass = 0; pass < SUBSPACE_ITERATIONS; pass++) {
+        Y.fill(0);
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < d; j++) {
+                const z = Z[i * d + j];
+                for (let c = 0; c < k; c++) Y[i * k + c] += z * Q[j * k + c];
+            }
+        }
+        Q.fill(0);
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < d; j++) {
+                const z = Z[i * d + j];
+                for (let c = 0; c < k; c++) Q[j * k + c] += z * Y[i * k + c];
+            }
+        }
+        for (let c = 0; c < k; c++) { // Gram-Schmidt.
+            for (let e = 0; e < c; e++) {
+                let overlap = 0;
+                for (let j = 0; j < d; j++) overlap += Q[j * k + c] * Q[j * k + e];
+                for (let j = 0; j < d; j++) Q[j * k + c] -= overlap * Q[j * k + e];
+            }
+            let length = 0;
+            for (let j = 0; j < d; j++) length += Q[j * k + c] ** 2;
+            length = Math.sqrt(length) || 1;
+            for (let j = 0; j < d; j++) Q[j * k + c] /= length;
+        }
+    }
+    return Q;
 }
 
 /**
- * Fits the model, dropping samples the fit cannot explain (the user glanced away, a bad frame).
- * Trimming on residuals rather than raw iris position keeps the deliberate head movement.
- * @param {Array<{frame: object, target: {x: number, y: number}}>} samples
- * @returns {object} A JSON-serializable model.
+ * Standardizes the features, optionally reduces them to their main patterns, and fits ridge
+ * regression. It is all linear, so the result folds down to one weight per raw feature.
  */
-export function fitModel(samples) {
-    let kept = samples;
-    let model = fitOnce(kept);
-    const errorOf = (m, s) => {
-        const p = predict(m, s.frame);
-        return Math.hypot(p.x - s.target.x, p.y - s.target.y);
-    };
+function fitLinear(rows, targets, ridge, components = 0) {
+    const n = rows.length;
+    const d = rows[0].length;
+    const mean = new Float64Array(d);
+    const std = new Float64Array(d);
+    for (const row of rows) for (let j = 0; j < d; j++) mean[j] += row[j] / n;
+    for (const row of rows) for (let j = 0; j < d; j++) std[j] += (row[j] - mean[j]) ** 2 / n;
+    for (let j = 0; j < d; j++) std[j] = Math.sqrt(std[j]) || 1;
 
+    const Z = new Float64Array(n * d);
+    rows.forEach((row, i) => {
+        for (let j = 0; j < d; j++) Z[i * d + j] = (row[j] - mean[j]) / std[j];
+    });
+
+    const k = components || d;
+    const Q = components ? mainSubspace(Z, n, d, k) : null;
+    const scores = Q ? new Float64Array(n * k) : Z;
+    if (Q) {
+        for (let i = 0; i < n; i++) {
+            for (let j = 0; j < d; j++) {
+                const z = Z[i * d + j];
+                for (let c = 0; c < k; c++) scores[i * k + c] += z * Q[j * k + c];
+            }
+        }
+    }
+
+    const biasX = targets.reduce((a, t) => a + t.x, 0) / n;
+    const biasY = targets.reduce((a, t) => a + t.y, 0) / n;
+    const A = Array.from({ length: k }, () => new Array(k).fill(0));
+    const rhsX = new Array(k).fill(0);
+    const rhsY = new Array(k).fill(0);
+    for (let i = 0; i < n; i++) {
+        for (let a = 0; a < k; a++) {
+            const v = scores[i * k + a];
+            rhsX[a] += v * (targets[i].x - biasX);
+            rhsY[a] += v * (targets[i].y - biasY);
+            for (let b = a; b < k; b++) A[a][b] += v * scores[i * k + b];
+        }
+    }
+    for (let a = 0; a < k; a++) {
+        A[a][a] += ridge;
+        for (let b = 0; b < a; b++) A[a][b] = A[b][a];
+    }
+
+    const fold = (w, bias) => {
+        const raw = new Array(d);
+        let offset = bias;
+        for (let j = 0; j < d; j++) {
+            let v = 0;
+            if (Q) for (let c = 0; c < k; c++) v += Q[j * k + c] * w[c];
+            else v = w[j];
+            raw[j] = v / std[j];
+            offset -= raw[j] * mean[j];
+        }
+        return { w: raw, b: offset };
+    };
+    return { x: fold(solveLinear(A, rhsX), biasX), y: fold(solveLinear(A, rhsY), biasY) };
+}
+
+function applyLinear(model, features) {
+    let x = model.x.b;
+    let y = model.y.b;
+    for (let j = 0; j < features.length; j++) {
+        x += model.x.w[j] * features[j];
+        y += model.y.w[j] * features[j];
+    }
+    return { x, y };
+}
+
+/** Fits, then refits without samples it cannot explain (a glance away, a bad frame). */
+function fitTrimmed(samples, featuresOf, ridge, components) {
+    const rows = samples.map(s => featuresOf(s.frame));
+    let kept = samples.map((_, i) => i);
+    const fit = () => fitLinear(kept.map(i => rows[i]), kept.map(i => samples[i].target), ridge, components);
+
+    let model = fit();
     for (let pass = 0; pass < TRIM_PASSES; pass++) {
-        const errors = kept.map(s => errorOf(model, s));
+        const errors = kept.map(i => {
+            const p = applyLinear(model, rows[i]);
+            return Math.hypot(p.x - samples[i].target.x, p.y - samples[i].target.y);
+        });
         const med = median(errors);
         const mad = median(errors.map(e => Math.abs(e - med)));
         const limit = med + TRIM_MAD_FACTOR * mad + 1e-6;
         kept = kept.filter((_, i) => errors[i] < limit);
-        model = fitOnce(kept);
+        model = fit();
     }
+    return model;
+}
+
+/**
+ * Fits both models.
+ * @param {Array<{frame: object, target: {x: number, y: number}}>} samples
+ * @returns {object} A JSON-serializable model.
+ */
+export function fitModel(samples) {
+    const model = {
+        geometric: fitTrimmed(samples, geometricFeatures, GEOMETRIC_RIDGE, 0),
+        shape: fitTrimmed(samples, shapeFeatures, SHAPE_RIDGE, SHAPE_COMPONENTS)
+    };
 
     // Open eyes read lowest when looking down, so set the blink line under the low end of the data.
-    const ears = kept.map(s => s.frame.ear).sort((a, b) => a - b);
+    const ears = samples.map(s => s.frame.ear).sort((a, b) => a - b);
     model.blinkEar = ears[Math.floor(ears.length * 0.05)] * BLINK_EAR_RATIO;
-    model.fitError = median(kept.map(s => errorOf(model, s)));
-    model.keptSamples = kept.length;
+    model.fitError = median(samples.map(s => {
+        const p = predict(model, s.frame);
+        return Math.hypot(p.x - s.target.x, p.y - s.target.y);
+    }));
     return model;
 }
 
 /** Predicts a gaze point, as a fraction of the calibrated screen. */
 export function predict(model, frame) {
-    const f = standardize(rawFeatures(frame), model.mean, model.std);
-    const dot = (w) => w.reduce((sum, v, i) => sum + v * f[i], 0);
-    return { x: model.biasX + dot(model.wx), y: model.biasY + dot(model.wy) };
+    const a = applyLinear(model.geometric, geometricFeatures(frame));
+    const b = applyLinear(model.shape, shapeFeatures(frame));
+    return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
 }
 
 export function isBlink(frame, model) {
@@ -192,13 +315,11 @@ function headRay({ tanYaw, tanPitch, tx, ty, dist }) {
  */
 export function fitHeadModel(samples) {
     const rows = samples.map(s => headRay(s.frame));
-    const solve = (values) => {
-        const At = transpose(rows);
-        const AtA = matMul(At, rows);
-        for (let i = 0; i < AtA.length; i++) AtA[i][i] += 1e-6;
-        return solveLinear(AtA, matMul(At, values.map(v => [v])).map(r => r[0]));
+    const solve = (axis) => {
+        const A = [0, 1, 2].map(a => [0, 1, 2].map(b => rows.reduce((sum, r) => sum + r[a] * r[b], 0) + (a === b ? 1e-6 : 0)));
+        return solveLinear(A, [0, 1, 2].map(a => rows.reduce((sum, r, i) => sum + r[a] * samples[i].target[axis], 0)));
     };
-    return { wx: solve(samples.map(s => s.target.x)), wy: solve(samples.map(s => s.target.y)) };
+    return { wx: solve('x'), wy: solve('y') };
 }
 
 export function predictHead(headModel, frame) {
