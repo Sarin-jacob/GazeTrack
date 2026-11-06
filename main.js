@@ -1,7 +1,7 @@
 // main.js - Camera, calibration flow and UI. The gaze maths lives in gaze-model.js.
 
 import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
-import { RIGHT_IRIS, LEFT_IRIS, extractFrame, fitModel, fitHeadModel, predict, isBlink, Pointer } from "./gaze-model.js";
+import { RIGHT_IRIS, LEFT_IRIS, extractFrame, fitModel, fitHeadModel, predict, isBlink, toViewport, Pointer } from "./gaze-model.js";
 import { isCaptureAvailable, startCapture, stopCapture, logEvent, logFrame } from "./capture.js";
 const { FaceLandmarker, FilesetResolver } = vision;
 
@@ -393,7 +393,9 @@ async function startCalibration() {
         await wait(100); // Let the label paint; fitting holds the page for a few seconds.
         state.model = fitModel(allData);
         state.model.head = noseData.length >= MIN_NOSE_SAMPLES ? fitHeadModel(noseData) : null;
-        state.model.fullscreen = Boolean(document.fullscreenElement);
+        // A fullscreen window sits exactly on its monitor, so this is the monitor's origin, in the
+        // same coordinates the window will report later. No other browser value is reliable here.
+        state.model.monitor = document.fullscreenElement ? { x: window.screenX, y: window.screenY } : null;
         state.model.rest = rest;
         state.pointer.reset();
         saveCalibrationModel();
@@ -569,26 +571,18 @@ function medianError(samples) {
 
 // --- Gaze Prediction ---
 function placeGazeDot(point) {
-    const { left, top } = toViewport(point);
+    const { left, top } = toViewport(point, state.model.monitor, {
+        screenWidth: screen.width,
+        screenHeight: screen.height,
+        screenX: window.screenX,
+        screenY: window.screenY,
+        outerWidth: window.outerWidth,
+        outerHeight: window.outerHeight,
+        innerWidth: window.innerWidth,
+        innerHeight: window.innerHeight
+    });
     gazeDot.style.left = `${left}px`;
     gazeDot.style.top = `${top}px`;
-}
-
-/**
- * Converts a gaze point to page coordinates. Calibration usually runs fullscreen, so its 0-1 range
- * spans the monitor, while tracking usually runs in a window that may be smaller or offset.
- */
-function toViewport({ x, y }) {
-    const clamp = (v, max) => Math.max(0, Math.min(max, v));
-    if (!state.model.fullscreen) {
-        return { left: clamp(x * window.innerWidth, window.innerWidth), top: clamp(y * window.innerHeight, window.innerHeight) };
-    }
-    const originX = window.screenX - (screen.availLeft ?? 0) + (window.outerWidth - window.innerWidth) / 2;
-    const originY = window.screenY - (screen.availTop ?? 0) + window.outerHeight - window.innerHeight;
-    return {
-        left: clamp(x * screen.width - originX, window.innerWidth),
-        top: clamp(y * screen.height - originY, window.innerHeight)
-    };
 }
 
 // --- Local Storage ---

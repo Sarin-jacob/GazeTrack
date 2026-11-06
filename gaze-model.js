@@ -328,6 +328,33 @@ export function predictHead(headModel, frame) {
     return { x: dot(headModel.wx), y: dot(headModel.wy) };
 }
 
+const WINDOW_TOLERANCE_PX = 50; // Window borders can hang slightly off the monitor.
+
+/**
+ * Converts a gaze point, as a fraction of the calibrated monitor, to page coordinates.
+ * @param {{x: number, y: number}} point
+ * @param {?{x: number, y: number}} monitor - Monitor origin seen at calibration, if it was fullscreen.
+ * @param {object} view - Current window and screen measurements.
+ */
+export function toViewport({ x, y }, monitor, view) {
+    const clamp = (v, max) => Math.max(0, Math.min(max, v));
+    const originX = view.screenX - (monitor?.x ?? 0) + (view.outerWidth - view.innerWidth) / 2;
+    const originY = view.screenY - (monitor?.y ?? 0) + view.outerHeight - view.innerHeight;
+
+    // If the window does not fit on the calibrated monitor, the numbers cannot be trusted: stretch
+    // the point over the window, so the dot is less exact but can never get stuck on an edge.
+    const onMonitor = monitor &&
+        originX >= -WINDOW_TOLERANCE_PX && originX + view.innerWidth <= view.screenWidth + WINDOW_TOLERANCE_PX &&
+        originY >= -WINDOW_TOLERANCE_PX && originY + view.innerHeight <= view.screenHeight + WINDOW_TOLERANCE_PX;
+    if (!onMonitor) {
+        return { left: clamp(x * view.innerWidth, view.innerWidth), top: clamp(y * view.innerHeight, view.innerHeight) };
+    }
+    return {
+        left: clamp(x * view.screenWidth - originX, view.innerWidth),
+        top: clamp(y * view.screenHeight - originY, view.innerHeight)
+    };
+}
+
 /**
  * One Euro filter: heavy smoothing while the signal is still, light smoothing while it moves fast.
  * Fixations stay steady and saccades don't lag, which a fixed smoothing factor can't do.

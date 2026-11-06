@@ -1,5 +1,5 @@
 // Scores gaze-model.js on real recordings: fits on the newest calibration in captures/ and tests
-// on every test run. Run with: node devtools/evaluate.mjs
+// on the runs recorded after it. Run with: node devtools/evaluate.mjs
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -55,7 +55,7 @@ console.log(`Fitted on ${calibration}: ${samples.length} samples in ${((performa
 model.head = fitHeadModel(calSegments.filter(s => s.phase === 'nose').flatMap(s => s.frames.map(frame => ({ frame, target: s.point }))));
 
 const allErrors = [];
-for (const name of names.filter(n => n.includes('test'))) {
+for (const name of names.filter(n => n.includes('test') && n > calibration)) {
     const byPose = {};
     for (const { phase, point, frames } of segments(path.join(captures, name))) {
         if (!phase.startsWith('test-')) continue;
