@@ -180,6 +180,33 @@ export function isBlink(frame, model) {
     return frame.ear < (model?.blinkEar ?? DEFAULT_BLINK_EAR);
 }
 
+// Where the line straight out of the face meets the camera plane, in cm. Moving and turning the
+// head are both in here with the right geometry, so a few nose-pointing samples are enough.
+function headRay({ tanYaw, tanPitch, tx, ty, dist }) {
+    return [1, tx + dist * tanYaw, ty + dist * tanPitch];
+}
+
+/**
+ * Fits the head pointer: an affine map from the head ray to the screen.
+ * @param {Array<{frame: object, target: {x: number, y: number}}>} samples - Nose-pointing samples.
+ */
+export function fitHeadModel(samples) {
+    const rows = samples.map(s => headRay(s.frame));
+    const solve = (values) => {
+        const At = transpose(rows);
+        const AtA = matMul(At, rows);
+        for (let i = 0; i < AtA.length; i++) AtA[i][i] += 1e-6;
+        return solveLinear(AtA, matMul(At, values.map(v => [v])).map(r => r[0]));
+    };
+    return { wx: solve(samples.map(s => s.target.x)), wy: solve(samples.map(s => s.target.y)) };
+}
+
+export function predictHead(headModel, frame) {
+    const f = headRay(frame);
+    const dot = (w) => w.reduce((sum, v, i) => sum + v * f[i], 0);
+    return { x: dot(headModel.wx), y: dot(headModel.wy) };
+}
+
 /**
  * One Euro filter: heavy smoothing while the signal is still, light smoothing while it moves fast.
  * Fixations stay steady and saccades don't lag, which a fixed smoothing factor can't do.
@@ -219,5 +246,60 @@ export class OneEuroFilter {
         this.value += OneEuroFilter.alpha(cutoff, dt) * (value - this.value);
         this.lastTime = time;
         return this.value;
+    }
+}
+
+const WARP_DISTANCE = 0.14; // Fraction of the screen. Further than this, the eyes have gone elsewhere.
+const WARP_SECONDS = 0.07;
+const DRIFT_SECONDS = 1.5;
+
+/**
+ * The on-screen pointer.
+ *   eyes: the gaze model alone.
+ *   head: the head pointer alone. Steadiest, but you aim with your nose.
+ *   both: the head moves the pointer directly, so it is steady and precise, while the gaze model
+ *         jumps it when the eyes go somewhere else and slowly removes any head drift.
+ */
+export class Pointer {
+    constructor() {
+        this.gaze = { x: new OneEuroFilter(), y: new OneEuroFilter() };
+        this.head = { x: new OneEuroFilter(1.5, 1), y: new OneEuroFilter(1.5, 1) };
+        this.reset();
+    }
+
+    reset() {
+        for (const f of [this.gaze.x, this.gaze.y, this.head.x, this.head.y]) f.reset();
+        this.position = null;
+        this.lastHead = null;
+        this.lastTime = null;
+    }
+
+    update(model, frame, time, mode) {
+        const rawGaze = predict(model, frame);
+        const gaze = { x: this.gaze.x.filter(rawGaze.x, time), y: this.gaze.y.filter(rawGaze.y, time) };
+        if (!model.head || mode === 'eyes') return (this.position = gaze);
+
+        const rawHead = predictHead(model.head, frame);
+        const head = { x: this.head.x.filter(rawHead.x, time), y: this.head.y.filter(rawHead.y, time) };
+        if (mode === 'head') return (this.position = head);
+
+        if (!this.lastHead) {
+            this.position = gaze;
+        } else {
+            const dt = Math.max(time - this.lastTime, 1e-3);
+            const moved = {
+                x: this.position.x + head.x - this.lastHead.x,
+                y: this.position.y + head.y - this.lastHead.y
+            };
+            const offset = Math.hypot(gaze.x - moved.x, gaze.y - moved.y);
+            const pull = 1 - Math.exp(-dt / (offset > WARP_DISTANCE ? WARP_SECONDS : DRIFT_SECONDS));
+            this.position = {
+                x: moved.x + pull * (gaze.x - moved.x),
+                y: moved.y + pull * (gaze.y - moved.y)
+            };
+        }
+        this.lastHead = head;
+        this.lastTime = time;
+        return this.position;
     }
 }

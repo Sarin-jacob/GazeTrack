@@ -4,7 +4,7 @@
 // This checks the geometry and the fit, nothing more. Real accuracy depends on how noisy
 // MediaPipe's landmarks are on a real webcam, which the noise values below only approximate.
 
-import { extractFrame, fitModel, predict, RIGHT_IRIS, LEFT_IRIS } from '../gaze-model.js';
+import { extractFrame, fitModel, fitHeadModel, predict, Pointer, RIGHT_IRIS, LEFT_IRIS } from '../gaze-model.js';
 
 // Seeded so runs are comparable.
 let seed = 12345;
@@ -135,28 +135,49 @@ const jitter = (head) => {
     };
 };
 
-function collect(withHeadPhase) {
+// `readTop` reproduces reading prompts at the top of the screen: for part of each head step the
+// eyes are on the text while the sample is still labelled with the dot.
+function collect(withHeadPhase, readTop = 0) {
     const samples = [];
     for (const target of grid) {
         const base = posedFor(target);
-        for (let i = 0; i < 36; i++) samples.push({ head: jitter(base), target });
+        for (let i = 0; i < 36; i++) samples.push({ head: jitter(base), target, gaze: target });
     }
     if (withHeadPhase) for (const m of MOVES) {
         const base = posedFor(m.point);
         for (let i = 0; i < 135; i++) {
             const head = jitter(base);
             head[m.key] += m.amp * Math.sin(i / 135 * 4 * Math.PI);
-            samples.push({ head, target: m.point });
+            samples.push({ head, target: m.point, gaze: i / 135 < readTop ? { x: 0.5, y: 0.2 } : m.point });
         }
     }
     return samples;
 }
 
+// Nose-pointing step: the face aims at each point, and the eyes are there too.
+function aimAt(target) {
+    const head = jitter(REST);
+    const sx = (target.x - 0.5) * SCREEN.w, sy = -1 - target.y * SCREEN.h;
+    head.yaw = Math.atan((sx - head.x) / head.z) + gauss(0.012);
+    head.pitch = -Math.atan((sy - head.y) / head.z) + gauss(0.012);
+    return head;
+}
+const NOSE_POINTS = [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.85, 0.85], [0.15, 0.85]].map(([x, y]) => ({ x, y }));
+function collectNose() {
+    const samples = [];
+    for (const target of NOSE_POINTS) for (let i = 0; i < 45; i++) samples.push({ head: aimAt(target), target, gaze: target });
+    return samples;
+}
+
 const toFrame = (r) => extractFrame(r.lm, r.matrix, W, H);
 
-const oldModel = fitOld(collect(false).map(s => ({ f: oldFeatures(render(s.head, s.target).lm), target: s.target })));
-const eyeOnly = fitModel(collect(false).map(s => ({ frame: toFrame(render(s.head, s.target)), target: s.target })));
-const newModel = fitModel(collect(true).map(s => ({ frame: toFrame(render(s.head, s.target)), target: s.target })));
+const labelled = (samples) => samples.map(s => ({ frame: toFrame(render(s.head, s.gaze)), target: s.target }));
+const oldModel = fitOld(collect(false).map(s => ({ f: oldFeatures(render(s.head, s.gaze).lm), target: s.target })));
+const eyeOnly = fitModel(labelled(collect(false)));
+const misread = fitModel(labelled(collect(true, 0.4)));
+const noseSamples = labelled(collectNose());
+const newModel = fitModel([...labelled(collect(true)), ...noseSamples]);
+newModel.head = fitHeadModel(noseSamples);
 
 const scenarios = {
     'still head': () => sway(0.3),
@@ -175,18 +196,42 @@ const medianOf = (v) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)];
 const pct = (v) => `${(v * 100).toFixed(1).padStart(5)}%`;
 
 console.log('Median error as a fraction of the screen, single frames, no smoothing\n');
-console.log('scenario          old      new (no head phase)  new');
+console.log('scenario           old     no head step  read prompts   new');
 for (const [name, gen] of Object.entries(scenarios)) {
-    const errs = [[], [], []];
+    const errs = [[], [], [], []];
     for (let i = 0; i < 1500; i++) {
         const target = { x: rand(), y: rand() };
         const r = render(gen(), target);
         const f = oldFeatures(r.lm);
         const frame = toFrame(r);
         const o = { x: clamp(dotp(f, oldModel.x)), y: clamp(dotp(f, oldModel.y)) };
-        [o, predict(eyeOnly, frame), predict(newModel, frame)].forEach((p, k) => {
+        [o, predict(eyeOnly, frame), predict(misread, frame), predict(newModel, frame)].forEach((p, k) => {
             errs[k].push(Math.hypot(clamp(p.x) - target.x, clamp(p.y) - target.y));
         });
     }
-    console.log(`${name.padEnd(16)} ${pct(medianOf(errs[0]))}   ${pct(medianOf(errs[1]))}               ${pct(medianOf(errs[2]))}`);
+    console.log(`${name.padEnd(16)} ${errs.map(e => pct(medianOf(e))).join('        ')}`);
+}
+
+// Pointer behaviour over time: 30 fps, a new target every 2 s, head drifting slowly.
+console.log('\nPointer over time: error while fixating, frame-to-frame jitter, time to reach a new target\n');
+for (const mode of ['eyes', 'head', 'both']) {
+    const pointer = new Pointer();
+    const errors = [], steps = [], arrive = [];
+    let target = { x: 0.5, y: 0.5 }, last = null, arrived = null;
+    for (let n = 0; n < 30 * 120; n++) {
+        const t = n / 30, phase = n % 60;
+        if (phase === 0) { target = { x: 0.1 + rand() * 0.8, y: 0.1 + rand() * 0.8 }; arrived = null; }
+        const head = mode === 'head' ? aimAt(target) : jitter(posedFor(target));
+        if (mode !== 'head') { head.x += 2 * Math.sin(t / 3); head.yaw += 0.04 * Math.sin(t / 5); }
+        const p = pointer.update(newModel, toFrame(render(head, target)), t, mode);
+        const e = Math.hypot(p.x - target.x, p.y - target.y);
+        if (arrived === null && e < 0.12) { arrived = phase / 30; arrive.push(arrived); }
+        if (phase >= 30) {
+            errors.push(e);
+            if (last) steps.push(Math.hypot(p.x - last.x, p.y - last.y));
+        }
+        last = { ...p };
+    }
+    const mean = (v) => v.reduce((a, b) => a + b, 0) / (v.length || 1);
+    console.log(`${mode.padEnd(5)} error ${pct(medianOf(errors))}   jitter ${(mean(steps) * 100).toFixed(2)}%   arrive ${mean(arrive).toFixed(2)} s (${arrive.length}/60 targets)`);
 }

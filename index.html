@@ -15,7 +15,14 @@
 
 
         <div id="calibration-overlay">
-            <div id="cal-status">Look at the point</div>
+            <div id="rec-badge">Recording to this computer</div>
+            <div id="cal-intro">
+                <h2>Before you start</h2>
+                <ul id="cal-intro-list"></ul>
+                <button id="cal-begin">Begin</button>
+            </div>
+            <div id="head-guide"><div id="head-marker"></div></div>
+            <div id="cal-status"></div>
             <div id="cal-point"></div>
         </div>
     </div>
@@ -25,6 +32,13 @@
         <button id="start-cal-btn" disabled>Start Calibration</button>
         <button id="test-btn" disabled>Test Accuracy</button>
         <button id="clear-cal-btn">Clear Data</button>
+        <label>Pointer
+            <select id="pointer-mode">
+                <option value="both">Eyes + head</option>
+                <option value="eyes">Eyes only</option>
+                <option value="head">Head only</option>
+            </select>
+        </label>
         <div id="status-text">Status: Waiting</div>
     </div>
 </main>

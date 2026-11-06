@@ -66,6 +66,16 @@ button:disabled {
     opacity: 0.6;
 }
 
+select {
+    background: var(--secondary);
+    color: var(--fg);
+    border: 0;
+    padding: 9px 10px;
+    border-radius: 8px;
+    margin-left: 6px;
+    font-size: 15px;
+}
+
 #status-text {
     margin-left: 12px;
     color: var(--muted);
@@ -79,24 +89,85 @@ button:disabled {
     display: none; /* Hidden by default */
     align-items: center;
     justify-content: center;
-    background: rgba(0, 0, 0, 0.7);
-    backdrop-filter: blur(5px);
+    background: rgba(0, 0, 0, 0.92); /* Dark enough that the video behind doesn't pull the eyes. */
 }
 
 #cal-status {
     position: absolute;
-    top: 20%;
-    max-width: 80%;
+    display: none;
+    max-width: 300px;
+    transform: translate(-50%, -50%);
     text-align: center;
-    font-size: 24px;
+    font-size: 18px;
     color: white;
-    background: rgba(0,0,0,0.5);
-    padding: 10px 20px;
-    border-radius: 10px;
+}
+
+#cal-intro {
+    display: none;
+    max-width: 560px;
+    padding: 0 24px;
+    font-size: 18px;
+    line-height: 1.5;
+    color: white;
+}
+
+#cal-intro h2 {
+    margin-top: 0;
+}
+
+#cal-intro li {
+    margin-bottom: 10px;
+}
+
+#rec-badge {
+    display: none;
+    position: absolute;
+    left: 16px;
+    bottom: 12px;
+    font-size: 13px;
+    color: var(--accent-gaze);
+}
+
+#head-guide {
+    display: none;
+    position: absolute;
+    width: 180px;
+    height: 180px;
+    border: 1px dashed rgba(255, 255, 255, 0.25);
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+}
+
+#head-marker, .head-pip {
+    position: absolute;
+    border-radius: 50%;
+    transform: translate(-50%, -50%);
+}
+
+#head-marker {
+    width: 12px;
+    height: 12px;
+    left: 50%;
+    top: 50%;
+    background: white;
+    z-index: 1;
+}
+
+.head-pip {
+    width: 30px;
+    height: 30px;
+    box-sizing: border-box;
+    border: 2px solid var(--accent-cal);
+}
+
+.head-pip.hit {
+    background: #5be38a;
+    border-color: #5be38a;
 }
 
 #cal-point {
     position: absolute;
+    display: none;
     width: 30px;
     height: 30px;
     background: var(--accent-cal);

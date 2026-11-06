@@ -1,7 +1,8 @@
 // main.js - Camera, calibration flow and UI. The gaze maths lives in gaze-model.js.
 
 import vision from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
-import { RIGHT_IRIS, LEFT_IRIS, extractFrame, fitModel, predict, isBlink, OneEuroFilter } from "./gaze-model.js";
+import { RIGHT_IRIS, LEFT_IRIS, extractFrame, fitModel, fitHeadModel, predict, isBlink, Pointer } from "./gaze-model.js";
+import { isCaptureAvailable, startCapture, stopCapture, logEvent, logFrame } from "./capture.js";
 const { FaceLandmarker, FilesetResolver } = vision;
 
 // --- DOM Elements ---
@@ -10,13 +11,20 @@ const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
 const gazeDot = document.getElementById('gaze-dot');
 const calOverlay = document.getElementById('calibration-overlay');
+const calIntro = document.getElementById('cal-intro');
+const calIntroList = document.getElementById('cal-intro-list');
+const calBeginBtn = document.getElementById('cal-begin');
 const calPoint = document.getElementById('cal-point');
 const calStatus = document.getElementById('cal-status');
+const headGuide = document.getElementById('head-guide');
+const headMarker = document.getElementById('head-marker');
+const recBadge = document.getElementById('rec-badge');
 const statusText = document.getElementById('status-text');
 const toggleVideoBtn = document.getElementById('toggle-video-btn');
 const startCalBtn = document.getElementById('start-cal-btn');
 const clearCalBtn = document.getElementById('clear-cal-btn');
 const testBtn = document.getElementById('test-btn');
+const pointerModeSelect = document.getElementById('pointer-mode');
 
 // --- App State ---
 let state = {
@@ -29,7 +37,8 @@ let state = {
     model: null,
     onFrame: null, // Set during calibration to receive each new frame.
     lastVideoTime: -1,
-    filters: { x: new OneEuroFilter(), y: new OneEuroFilter() }
+    pointer: new Pointer(),
+    canCapture: false
 };
 
 // --- Constants ---
@@ -37,36 +46,67 @@ const CALIBRATION_POINT_COUNT = 15;
 const SETTLE_DURATION_MS = 300; // The eyes need a moment to land on the point.
 const HOLD_DURATION_MS = 1300;
 const TRANSITION_DURATION_MS = 700;
-const READ_DURATION_MS = 1800; // Time to read a head-movement prompt before samples are taken.
-const HEAD_MOVE_DURATION_MS = 4500;
+const NOSE_SETTLE_DURATION_MS = 900; // Heads land slower than eyes.
+const NOSE_HOLD_DURATION_MS = 1500;
+const HEAD_STEP_TIMEOUT_MS = 12000;
+const TEST_STEP_TIMEOUT_MS = 8000;
 const MIN_SAMPLES = 200;
-const MIN_HEAD_MOTION = { tanYaw: 0.03, tx: 0.7 }; // Standard deviations; below both, the head barely moved.
+const MIN_NOSE_SAMPLES = 40;
 const OPEN_EYE_RATIO = 0.7; // Frames this far under a point's typical eye openness are blinks.
+const GUIDE_RADIUS_PX = 90;
+const PIP_REACH = 0.45; // How close the marker must get to a ring, in guide radii.
+
+const CALIBRATION_INTRO = [
+    'Turn your sound on. A voice tells you what to do, so you never need to look away to read.',
+    'First, follow the yellow dot with your eyes.',
+    'Then point your nose at the dot.',
+    'Last, keep your eyes on the dot and move your head. A small white marker follows your head. Steer it onto the rings around the dot.'
+];
+const TEST_INTRO = [
+    'Turn your sound on. A voice tells you what to do.',
+    'Move your head until the white marker touches the ring, then hold still.',
+    'Then look at the blue dot wherever it goes, with your head staying where it is.'
+];
+const HEAD_TEST_INTRO = [
+    'Turn your sound on.',
+    'Point your nose at the blue dot wherever it goes.'
+];
+
+const NOSE_POINTS = [[0.5, 0.5], [0.15, 0.15], [0.85, 0.15], [0.85, 0.85], [0.15, 0.85]].map(([x, y]) => ({ x, y }));
+
+// How each kind of head movement drives the marker. Values are in guide radii, mirrored so the
+// marker goes the way you move. `v` is up.
+const SIDES = [[-1, 0], [1, 0], [0, -1], [0, 1]];
+const HEAD_AXES = {
+    turn: (f) => [-f.tanYaw / 0.25, f.tanPitch / 0.16],
+    slide: (f) => [-f.tx / 6, f.ty / 4],
+    lean: (f) => [0, -f.dist / 8]
+};
 
 // The model can only learn what head movement does if it sees some. Each step moves the head
 // while the eyes stay on a fixed dot, so the gaze target is known while head and eyes both change.
-const HEAD_MOVES = [
-    { point: { x: 0.5, y: 0.5 }, text: 'Eyes on the dot. Slowly turn your head left and right' },
-    { point: { x: 0.1, y: 0.1 }, text: 'Eyes on the dot. Slowly nod up and down' },
-    { point: { x: 0.9, y: 0.1 }, text: 'Eyes on the dot. Slide your head left and right' },
-    { point: { x: 0.9, y: 0.9 }, text: 'Eyes on the dot. Lean in, then back' },
-    { point: { x: 0.1, y: 0.9 }, text: 'Eyes on the dot. Sit up tall, then slouch' }
+const HEAD_STEPS = [
+    { point: { x: 0.5, y: 0.5 }, axis: 'turn', pips: SIDES, speech: 'Eyes on the dot. Turn your head to touch each ring.', label: 'Turn your head' },
+    { point: { x: 0.15, y: 0.15 }, axis: 'slide', pips: SIDES, speech: 'Eyes on the dot. Now slide your head without turning it.', label: 'Slide your head' },
+    { point: { x: 0.85, y: 0.15 }, axis: 'turn', pips: SIDES, speech: 'Turn your head again.', label: 'Turn your head' },
+    { point: { x: 0.85, y: 0.85 }, axis: 'lean', pips: [[0, -1], [0, 1]], speech: 'Lean in, then lean back.', label: 'Lean in and back' },
+    { point: { x: 0.15, y: 0.85 }, axis: 'slide', pips: SIDES, speech: 'Last one. Slide your head again.', label: 'Slide your head' }
 ];
 
 // Accuracy test: look at known points with the head held in different places. The points are
 // off the calibration grid, so this measures the model on data it was not fitted to.
-const TEST_POSE_DURATION_MS = 3500;
 const TEST_SETTLE_DURATION_MS = 500;
 const TEST_HOLD_DURATION_MS = 1000;
 const TEST_POINTS = [{ x: 0.3, y: 0.3 }, { x: 0.7, y: 0.3 }, { x: 0.7, y: 0.7 }, { x: 0.3, y: 0.7 }];
 const TEST_POSES = [
-    { name: 'still', text: 'Sit normally' },
-    { name: 'left', text: 'Move your head about 10 cm to your left and stay there' },
-    { name: 'right', text: 'Move your head about 10 cm to your right and stay there' },
-    { name: 'closer', text: 'Lean about 15 cm closer and stay there' },
-    { name: 'further', text: 'Lean about 15 cm back and stay there' },
-    { name: 'turned', text: 'Turn your head a little to one side and keep it there' }
+    { name: 'still', speech: 'Sit normally and follow the dot.' },
+    { name: 'left', axis: 'slide', pips: [[-1, 0]], speech: 'Slide your head to the left, to the ring.' },
+    { name: 'right', axis: 'slide', pips: [[1, 0]], speech: 'Slide your head to the right, to the ring.' },
+    { name: 'closer', axis: 'lean', pips: [[0, 1]], speech: 'Lean in to the ring.' },
+    { name: 'further', axis: 'lean', pips: [[0, -1]], speech: 'Lean back to the ring.' },
+    { name: 'turned', axis: 'turn', pips: [[1, 0]], speech: 'Turn your head to the ring.' }
 ];
+const HEAD_TEST_POSES = [{ name: 'nose', speech: 'Point your nose at the dot.' }];
 
 /**
  * Generates a grid of calibration points dynamically based on the viewport's aspect ratio,
@@ -108,6 +148,7 @@ async function initialize() {
     await setupFaceLandmarker();
     loadCalibrationModel();
     addEventListeners();
+    state.canCapture = await isCaptureAvailable();
     updateUI();
 }
 
@@ -213,11 +254,14 @@ function processFrame(results) {
     const matrix = results.facialTransformationMatrixes[0].data;
     const frame = extractFrame(landmarks, matrix, video.videoWidth, video.videoHeight);
 
-    if (state.onFrame) {
-        state.onFrame(frame);
-    } else if (state.model && !state.isCalibrating) {
-        predictGaze(frame);
+    // Hold the pointer through blinks; the iris landmarks jump while the eye closes.
+    if (state.model && !isBlink(frame, state.model)) {
+        frame.pointer = state.pointer.update(state.model, frame, performance.now() / 1000, pointerModeSelect.value);
+        if (!state.isCalibrating) placeGazeDot(frame.pointer);
     }
+
+    logFrame(frame);
+    state.onFrame?.(frame);
 }
 
 function getIrisData(landmarks) {
@@ -241,8 +285,10 @@ function drawIrisPoints(lc, rc) {
     ctx.fill();
 }
 
-// --- Calibration Logic ---
-async function enterOverlay() {
+// --- Overlay ---
+// Everything to read goes on the intro screen, before any samples are taken. After that,
+// instructions are spoken, because reading means looking away from the dot being measured.
+async function enterOverlay(introLines, label) {
     state.isCalibrating = true;
     updateUI();
 
@@ -253,117 +299,182 @@ async function enterOverlay() {
     }
 
     calOverlay.style.display = 'flex';
+    calPoint.style.display = 'none';
+    calStatus.style.display = 'none';
+    calIntroList.replaceChildren(...introLines.map(line => {
+        const item = document.createElement('li');
+        item.textContent = line;
+        return item;
+    }));
+    calIntro.style.display = 'block';
+    calBeginBtn.focus();
+    await new Promise(resolve => calBeginBtn.addEventListener('click', resolve, { once: true }));
+    calIntro.style.display = 'none';
+    calPoint.style.display = 'block';
+    calStatus.style.display = 'block';
+
+    if (state.canCapture) {
+        startCapture(state.videoStream, label);
+        recBadge.style.display = 'block';
+    }
 }
 
 function exitOverlay() {
     if (document.fullscreenElement) {
         document.exitFullscreen();
     }
+    recBadge.style.display = 'none';
     calOverlay.style.display = 'none';
     state.isCalibrating = false;
     updateUI();
 }
 
+/** Speaks an instruction, and shows a short label beside the dot. Resolves when it has finished. */
+function say(speech, label = '') {
+    calStatus.textContent = label;
+    logEvent('say', { speech });
+    if (!('speechSynthesis' in window)) return wait(1500);
+
+    return new Promise(resolve => {
+        const fallback = setTimeout(resolve, 1500 + speech.length * 90); // Some systems never fire onend.
+        const utterance = new SpeechSynthesisUtterance(speech);
+        utterance.onend = utterance.onerror = () => {
+            clearTimeout(fallback);
+            resolve();
+        };
+        speechSynthesis.cancel();
+        speechSynthesis.speak(utterance);
+    });
+}
+
+// --- Calibration Logic ---
 async function startCalibration() {
-    await enterOverlay();
+    await enterOverlay(CALIBRATION_INTRO, 'calibration');
     let lastPoint = { x: 0.5, y: 0.5 };
     placeCalPoint(lastPoint.x, lastPoint.y);
-    calStatus.textContent = "Sit comfortably. Keep your eyes on the dot.";
-    await wait(2000);
+    await say('Follow the dot with your eyes.', 'Follow the dot');
 
     // Generated here, not at load, so the grid matches the fullscreen aspect ratio.
     const points = generateCalibrationPoints(CALIBRATION_POINT_COUNT);
     const gridData = [];
-
     for (let i = 0; i < points.length; i++) {
         const point = points[i];
-        calStatus.textContent = "Follow the point";
+        calStatus.textContent = `${i + 1} / ${points.length}`;
         await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
-        calStatus.textContent = `Hold your gaze (${i + 1}/${points.length})`;
         await wait(SETTLE_DURATION_MS);
-        gridData.push(...await collectSamples(point, HOLD_DURATION_MS));
+        gridData.push(...await collectSamples(point, HOLD_DURATION_MS, 'grid'));
         lastPoint = point;
     }
 
-    const headData = [];
-    for (const { point, text } of HEAD_MOVES) {
-        calStatus.textContent = text;
+    await say('Now point your nose at the dot.', 'Point your nose');
+    const noseData = [];
+    for (const point of NOSE_POINTS) {
         await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
-        await wait(READ_DURATION_MS);
-        headData.push(...await collectSamples(point, HEAD_MOVE_DURATION_MS));
+        await wait(NOSE_SETTLE_DURATION_MS);
+        noseData.push(...await collectSamples(point, NOSE_HOLD_DURATION_MS, 'nose'));
         lastPoint = point;
     }
 
-    const allData = [...gridData, ...headData];
+    const rest = restPose(gridData);
+    const headData = [];
+    let stepsFinished = 0;
+    for (const step of HEAD_STEPS) {
+        await animatePointTransition(lastPoint, step.point, TRANSITION_DURATION_MS);
+        await say(step.speech, step.label);
+        const { samples, finished } = await steerHead(step, rest, HEAD_STEP_TIMEOUT_MS);
+        headData.push(...samples);
+        if (finished) stepsFinished++;
+        lastPoint = step.point;
+    }
+
+    const allData = [...gridData, ...noseData, ...headData];
     if (allData.length >= MIN_SAMPLES) {
         state.model = fitModel(allData);
+        state.model.head = noseData.length >= MIN_NOSE_SAMPLES ? fitHeadModel(noseData) : null;
         state.model.fullscreen = Boolean(document.fullscreenElement);
-        resetFilters();
+        state.model.rest = rest;
+        state.pointer.reset();
         saveCalibrationModel();
-        window.gazeDebug.calibration = allData;
-        updateStatus(describeCalibration(state.model, headData));
+        updateStatus(`Calibrated. Typical fit error ${(state.model.fitError * 100).toFixed(1)}% of the screen. Head steps finished: ${stepsFinished}/${HEAD_STEPS.length}.`);
     } else {
         updateStatus(`Calibration failed: not enough data. (Collected ${allData.length})`);
     }
 
+    await say('All done.');
+    await finishCapture({ model: state.model, stepsFinished });
     exitOverlay();
 }
 
-// --- Accuracy Test ---
-async function startAccuracyTest() {
-    await enterOverlay();
-    calPoint.classList.add('test');
-    let lastPoint = { x: 0.5, y: 0.5 };
-    placeCalPoint(lastPoint.x, lastPoint.y);
-
-    const results = [];
-    for (const pose of TEST_POSES) {
-        calStatus.textContent = pose.text;
-        await wait(TEST_POSE_DURATION_MS);
-        calStatus.textContent = 'Look at the dot';
-
-        const samples = [];
-        for (const point of TEST_POINTS) {
-            await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
-            await wait(TEST_SETTLE_DURATION_MS);
-            samples.push(...await collectSamples(point, TEST_HOLD_DURATION_MS));
-            lastPoint = point;
-        }
-        results.push({ pose: pose.name, error: medianError(samples), samples });
-    }
-
-    calPoint.classList.remove('test');
-    window.gazeDebug.accuracyTest = results;
-    updateStatus(`Median error, % of screen: ${results.map(r => `${r.pose} ${(r.error * 100).toFixed(1)}`).join(', ')}`);
-    exitOverlay();
+/** Stops any recording and adds where it went to the status line. */
+async function finishCapture(summary) {
+    const id = await stopCapture(summary);
+    if (id) statusText.textContent += ` Saved capture ${id}.`;
 }
 
-function medianError(samples) {
-    const errors = samples.map(({ frame, target }) => {
-        const p = predict(state.model, frame);
-        return Math.hypot(p.x - target.x, p.y - target.y);
-    }).sort((a, b) => a - b);
-    return errors[Math.floor(errors.length / 2)] ?? NaN;
-}
-
-function describeCalibration(model, headData) {
-    const std = (key) => {
-        const values = headData.map(d => d.frame[key]);
-        const mean = values.reduce((a, b) => a + b, 0) / (values.length || 1);
-        return Math.sqrt(values.reduce((a, v) => a + (v - mean) ** 2, 0) / (values.length || 1));
+/** The natural seated head position: the median of each value over the given samples. */
+function restPose(samples) {
+    const median = (key) => {
+        const values = samples.map(s => s.frame[key]).sort((a, b) => a - b);
+        return values[Math.floor(values.length / 2)];
     };
-    const fit = `Calibrated. Typical fit error ${(model.fitError * 100).toFixed(1)}% of the screen.`;
-    const headMoved = std('tanYaw') >= MIN_HEAD_MOTION.tanYaw || std('tx') >= MIN_HEAD_MOTION.tx;
-    return headMoved ? fit : `${fit} Your head barely moved in the movement steps, so recalibrate if the dot drifts when you move.`;
+    return { tanYaw: median('tanYaw'), tanPitch: median('tanPitch'), tx: median('tx'), ty: median('ty'), dist: median('dist') };
 }
 
-/** Collects frames for a fixed time, leaving out blinks. */
-async function collectSamples(point, duration) {
+/**
+ * Shows the marker and rings around the dot and runs until every ring is touched, or time runs
+ * out. The rings are close enough to the dot that the eyes can stay put, and they are centred on
+ * the rest pose, not the head's position right now, so every ring stays reachable.
+ */
+async function steerHead({ point, axis, pips }, rest, timeout) {
+    const read = HEAD_AXES[axis];
+    const origin = read(rest);
+    const rings = pips.map(([u, v]) => {
+        const ring = document.createElement('div');
+        ring.className = 'head-pip';
+        ring.style.left = `calc(50% + ${u * GUIDE_RADIUS_PX}px)`;
+        ring.style.top = `calc(50% + ${-v * GUIDE_RADIUS_PX}px)`;
+        headGuide.appendChild(ring);
+        return { u, v, ring, hit: false };
+    });
+    headGuide.style.display = 'block';
+
+    const isDone = (frame) => {
+        const [rawU, rawV] = read(frame);
+        const u = rawU - origin[0];
+        const v = rawV - origin[1];
+        headMarker.style.left = `calc(50% + ${Math.max(-1.3, Math.min(1.3, u)) * GUIDE_RADIUS_PX}px)`;
+        headMarker.style.top = `calc(50% + ${-Math.max(-1.3, Math.min(1.3, v)) * GUIDE_RADIUS_PX}px)`;
+        for (const r of rings) {
+            if (!r.hit && Math.hypot(u - r.u, v - r.v) < PIP_REACH) {
+                r.hit = true;
+                r.ring.classList.add('hit');
+            }
+        }
+        return rings.every(r => r.hit);
+    };
+
+    const samples = await collectSamples(point, timeout, `head-${axis}`, isDone);
+    rings.forEach(r => r.ring.remove());
+    headGuide.style.display = 'none';
+    return { samples, finished: rings.every(r => r.hit) };
+}
+
+/** Collects frames until the time is up or isDone says so, leaving out blinks. */
+async function collectSamples(point, duration, phase, isDone = () => false) {
     const frames = [];
-    state.onFrame = (frame) => frames.push(frame);
+    let done = false;
+    state.onFrame = (frame) => {
+        frames.push(frame);
+        done = isDone(frame);
+    };
+    logEvent('collect-start', { point, phase });
     calPoint.classList.add('collecting');
-    await wait(duration);
+
+    const endTime = performance.now() + duration;
+    while (!done && performance.now() < endTime) await wait(30);
+
     calPoint.classList.remove('collecting');
+    logEvent('collect-end', { point, phase });
     state.onFrame = null;
 
     const ears = frames.map(f => f.ear).sort((a, b) => a - b);
@@ -376,8 +487,17 @@ function wait(ms) {
 }
 
 function placeCalPoint(normX, normY) {
-    calPoint.style.left = `${normX * 100}%`;
-    calPoint.style.top = `${normY * 100}%`;
+    for (const el of [calPoint, headGuide]) {
+        el.style.left = `${normX * 100}%`;
+        el.style.top = `${normY * 100}%`;
+    }
+
+    // The label sits just past the head guide, on whichever side has room.
+    const labelHalfWidth = 150;
+    const x = Math.max(labelHalfWidth, Math.min(window.innerWidth - labelHalfWidth, normX * window.innerWidth));
+    const offset = GUIDE_RADIUS_PX + 40;
+    calStatus.style.left = `${x}px`;
+    calStatus.style.top = `${normY * window.innerHeight + (normY > 0.7 ? -offset : offset)}px`;
 }
 
 async function animatePointTransition(from, to, duration) {
@@ -401,23 +521,55 @@ async function animatePointTransition(from, to, duration) {
     });
 }
 
-// --- Gaze Prediction ---
-function predictGaze(frame) {
-    if (isBlink(frame, state.model)) return; // Hold the dot; the iris landmarks jump during a blink.
+// --- Accuracy Test ---
+async function startAccuracyTest() {
+    const mode = pointerModeSelect.value;
+    const headOnly = mode === 'head';
+    await enterOverlay(headOnly ? HEAD_TEST_INTRO : TEST_INTRO, `test-${mode}`);
+    calPoint.classList.add('test');
+    let lastPoint = { x: 0.5, y: 0.5 };
+    placeCalPoint(lastPoint.x, lastPoint.y);
 
-    const raw = predict(state.model, frame);
-    const now = performance.now() / 1000;
-    const { left, top } = toViewport({
-        x: state.filters.x.filter(raw.x, now),
-        y: state.filters.y.filter(raw.y, now)
-    });
-    gazeDot.style.left = `${left}px`;
-    gazeDot.style.top = `${top}px`;
+    const results = [];
+    for (const pose of headOnly ? HEAD_TEST_POSES : TEST_POSES) {
+        await animatePointTransition(lastPoint, { x: 0.5, y: 0.5 }, TRANSITION_DURATION_MS);
+        lastPoint = { x: 0.5, y: 0.5 };
+        await say(pose.speech, pose.name);
+        if (pose.axis) {
+            await steerHead({ point: lastPoint, ...pose }, state.model.rest, TEST_STEP_TIMEOUT_MS);
+            await say('Hold that, and follow the dot.', 'Hold still');
+        }
+
+        const samples = [];
+        for (const point of TEST_POINTS) {
+            await animatePointTransition(lastPoint, point, TRANSITION_DURATION_MS);
+            await wait(TEST_SETTLE_DURATION_MS);
+            samples.push(...await collectSamples(point, TEST_HOLD_DURATION_MS, `test-${pose.name}`));
+            lastPoint = point;
+        }
+        results.push({ pose: pose.name, error: medianError(samples) });
+    }
+
+    calPoint.classList.remove('test');
+    updateStatus(`Median error (${pointerModeSelect.selectedOptions[0].text}), % of screen: ${results.map(r => `${r.pose} ${(r.error * 100).toFixed(1)}`).join(', ')}.`);
+    await say('All done.');
+    await finishCapture({ model: state.model, mode, results });
+    exitOverlay();
 }
 
-function resetFilters() {
-    state.filters.x.reset();
-    state.filters.y.reset();
+function medianError(samples) {
+    const errors = samples.map(({ frame, target }) => {
+        const p = frame.pointer ?? predict(state.model, frame);
+        return Math.hypot(p.x - target.x, p.y - target.y);
+    }).sort((a, b) => a - b);
+    return errors[Math.floor(errors.length / 2)] ?? NaN;
+}
+
+// --- Gaze Prediction ---
+function placeGazeDot(point) {
+    const { left, top } = toViewport(point);
+    gazeDot.style.left = `${left}px`;
+    gazeDot.style.top = `${top}px`;
 }
 
 /**
@@ -438,7 +590,7 @@ function toViewport({ x, y }) {
 }
 
 // --- Local Storage ---
-const MODEL_STORAGE_KEY = 'gaze_head_model_v4';
+const MODEL_STORAGE_KEY = 'gaze_head_model_v5';
 
 function saveCalibrationModel() {
     localStorage.setItem(MODEL_STORAGE_KEY, JSON.stringify(state.model));
@@ -470,6 +622,7 @@ function addEventListeners() {
     startCalBtn.addEventListener('click', startCalibration);
     clearCalBtn.addEventListener('click', clearCalibrationModel);
     testBtn.addEventListener('click', startAccuracyTest);
+    pointerModeSelect.addEventListener('change', () => state.pointer.reset());
 }
 
 function updateStatus(text) {
@@ -485,5 +638,4 @@ function updateUI() {
 }
 
 // --- Start the App ---
-window.gazeDebug = {}; // Numbers only, never images: last calibration and test samples, for analysis.
 initialize();
